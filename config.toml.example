@@ -4,6 +4,7 @@
 interval = 2.0        # seconds between measurements
 ascii = false         # true: plain ASCII instead of braille
 graph_height = "auto" # "auto", or 1-4 rows per graph
+background = 234      # xterm-256 colour index, or "none" for the terminal's own
 
 [llama]
 # Which systemd units to look for, in the user and system scopes.

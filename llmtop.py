@@ -35,7 +35,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -401,8 +401,16 @@ class GpuTimeTracker:
 
     def __init__(self) -> None:
         self._prev: dict[int, tuple[float, int]] = {}
+        self._touched: set[int] = set()
+
+    def sweep(self) -> None:
+        """Forget processes that were not measured in this round."""
+        for pid in [p for p in self._prev if p not in self._touched]:
+            del self._prev[pid]
+        self._touched.clear()
 
     def percent(self, pid: int, engine_ns: int) -> float | None:
+        self._touched.add(pid)
         now = time.monotonic()
         prev = self._prev.get(pid)
         self._prev[pid] = (now, engine_ns)
@@ -422,8 +430,10 @@ class CpuTracker:
 
     def __init__(self) -> None:
         self._prev: dict[int, tuple[float, int]] = {}
+        self._touched: set[int] = set()
 
     def percent(self, pid: int, ticks: int) -> float | None:
+        self._touched.add(pid)
         now = time.monotonic()
         prev = self._prev.get(pid)
         self._prev[pid] = (now, ticks)
@@ -434,10 +444,17 @@ class CpuTracker:
             return None
         return max(0.0, (ticks - prev[1]) / CLK_TCK / elapsed * 100.0)
 
-    def forget_except(self, pids: set[int]) -> None:
-        for pid in list(self._prev):
-            if pid not in pids:
-                del self._prev[pid]
+    def sweep(self) -> None:
+        """Forget processes that were not measured in this round.
+
+        Tracking what was touched rather than which PIDs end up displayed
+        matters: a single loaded model is folded into its parent row, and
+        its runner PID would otherwise be dropped - and its CPU reading with
+        it - on every round.
+        """
+        for pid in [p for p in self._prev if p not in self._touched]:
+            del self._prev[pid]
+        self._touched.clear()
 
 
 class RateTracker:
@@ -703,6 +720,7 @@ class Collector:
         self._npu_probed = False
         self._guards_primed = False
         self._prev_cpu_total: tuple[int, int] | None = None
+        self._machine: dict | None = None
 
     # -- llama.cpp ---------------------------------------------------------
 
@@ -893,7 +911,7 @@ class Collector:
         elif socket_unit:
             be.state = SLEEPING
             be.port = sock_port
-            be.detail = f"socket {sock_port}" if sock_port else "socket armed"
+            be.detail = "socket-activated"
             left = props.get("InactiveEnterTimestampMonotonic")
             if left and left.isdigit() and int(left) > 0:
                 be.since = now_mono - int(left) / 1e6
@@ -1016,7 +1034,9 @@ class Collector:
             if details.get("quantization_level"):
                 child.extras.append(details["quantization_level"])
             expires = parse_iso(entry.get("expires_at"))
-            if expires:
+            # While a request runs Ollama reports a zero time (year 1); that
+            # is "not scheduled", not "already unloaded".
+            if expires and expires > 946684800:
                 child.idle_in = expires - now
 
             runner = self._match_runner(entry, runners, blobs)
@@ -1192,7 +1212,13 @@ class Collector:
             dev = card / "device"
             if not (dev / "mem_info_gtt_used").exists():
                 continue
-            gpu: dict = {"name": read_text(dev / "product_name") or "AMD GPU",
+            name = read_text(dev / "product_name")
+            if not name:
+                # Integrated GPUs rarely name themselves in sysfs, but the CPU
+                # model string does: "... w/ Radeon 8060S".
+                m = re.search(r"\bw/\s*(.+)$", self.machine().get("cpu_name") or "")
+                name = m.group(1).strip() if m else "AMD GPU"
+            gpu: dict = {"name": name,
                          "busy": read_int(dev / "gpu_busy_percent"),
                          "vram_used": read_int(dev / "mem_info_vram_used"),
                          "vram_total": read_int(dev / "mem_info_vram_total"),
@@ -1302,8 +1328,32 @@ class Collector:
 
     # -- system ------------------------------------------------------------
 
+    def machine(self) -> dict:
+        """Host, machine model and CPU name - read once, they do not change."""
+        if self._machine is not None:
+            return self._machine
+        junk = {"", "to be filled by o.e.m.", "default string", "system product name",
+                "system manufacturer", "not specified", "none", "o.e.m."}
+
+        def dmi(name: str) -> str | None:
+            value = (read_text(f"/sys/class/dmi/id/{name}") or "").strip()
+            return None if value.lower() in junk else value
+
+        cpu_name = None
+        for line in (read_text("/proc/cpuinfo") or "").splitlines():
+            if line.startswith("model name"):
+                cpu_name = line.split(":", 1)[1].strip()
+                break
+        vendor, product = dmi("sys_vendor"), dmi("product_name")
+        machine = (product or "").replace("_", " ")
+        if vendor and vendor.lower() not in machine.lower():
+            machine = f"{vendor} {machine}".strip()
+        self._machine = {"host": os.uname().nodename, "machine": machine or None,
+                         "cpu_name": cpu_name, "threads": os.cpu_count()}
+        return self._machine
+
     def collect_system(self) -> dict:
-        info: dict = {}
+        info: dict = dict(self.machine())
         mem = read_text("/proc/meminfo") or ""
         fields = {}
         for line in mem.splitlines():
@@ -1364,9 +1414,8 @@ class Collector:
             snap.system = f_sys.result()
         llama = self.collect_llama(o_pids | l_pids)
         snap.backends = [*llama, ollama, lemon]
-        live = {b.pid for b in snap.backends if b.pid}
-        live |= {c.pid for b in snap.backends for c in b.children if c.pid}
-        self.cpu.forget_except(live)
+        self.cpu.sweep()
+        self.gputime.sweep()
         return snap
 
 
@@ -1375,7 +1424,8 @@ class Collector:
 # --------------------------------------------------------------------------
 
 DEFAULT_CFG: dict = {
-    "ui": {"interval": 2.0, "ascii": False, "graph_height": "auto"},
+    "ui": {"interval": 2.0, "ascii": False, "graph_height": "auto",
+           "background": 234},
     "llama": {
         "unit_glob_socket": "llama-*.socket",
         "unit_glob_service": "llama-*.service",
@@ -1441,21 +1491,41 @@ STATE_WORD = {RUNNING: "running", SLEEPING: "asleep", STOPPED: "stopped",
 KIND_TITLE = {"llama": "llama.cpp", "ollama": "Ollama", "lemonade": "Lemonade"}
 
 
+ELLIPSIS = "…"
+
+
+def fit(text: str, width: int) -> str:
+    """Exactly `width` characters: padded, or cut with an ellipsis."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.ljust(width)
+    return text[: width - 1] + ELLIPSIS
+
+
 class Line:
-    """A single output line that knows how much room is left."""
+    """One output line of fixed width.
+
+    Fields go in left to right. Once something fails to fit, the line is
+    closed: a shorter field further along must never slip into an earlier
+    column, because that slipping is exactly what makes a display wander.
+    """
 
     def __init__(self, width: int) -> None:
         self.width = max(1, width)
         self.segs: list[Seg] = []
         self.used = 0
+        self.full = False
 
     @property
     def left(self) -> int:
         return self.width - self.used
 
     def add(self, text: str, style: str = "") -> bool:
-        """Append if it still fits; otherwise drop it and report so."""
-        if not text or len(text) > self.left:
+        if not text:
+            return True
+        if self.full or len(text) > self.left:
+            self.full = True
             return False
         self.segs.append((text, style))
         self.used += len(text)
@@ -1463,52 +1533,81 @@ class Line:
 
     def add_segs(self, segs: list[Seg]) -> bool:
         total = sum(len(t) for t, _ in segs)
-        if total > self.left:
+        if self.full or total > self.left:
+            self.full = True
             return False
         self.segs.extend(segs)
         self.used += total
         return True
 
     def add_clipped(self, text: str, style: str = "", minimum: int = 4) -> bool:
-        """Append, shortening with an ellipsis when space is tight."""
-        if self.left < minimum:
+        """Append the trailing field, shortened with an ellipsis if needed."""
+        if not text:
+            return True
+        if self.full or self.left < minimum:
+            self.full = True
             return False
-        if len(text) <= self.left:
-            return self.add(text, style)
-        return self.add(text[: self.left - 1] + "…", style)
+        if len(text) > self.left:
+            text = text[: self.left - 1] + ELLIPSIS
+        return self.add(text, style)
+
+    def padded(self) -> list[Seg]:
+        if self.used < self.width:
+            return [*self.segs, (" " * (self.width - self.used), "")]
+        return list(self.segs)
 
 
 class Layout:
-    """Sizes derived from the current terminal, recomputed on every frame."""
+    """Sizes derived from the current terminal, recomputed on every frame.
 
-    def __init__(self, width: int, height: int, graph_height: str | int) -> None:
-        self.width = max(20, width)
-        self.height = max(6, height)
-        self.wide = self.width >= 96
-        self.mid = 72 <= self.width < 96
-        self.narrow = self.width < 72
-        self.graph_w = max(8, min(40, (self.width - 52) // 2))
-        self.meter_w = max(6, min(14, (self.width - 52) // 4))
-        self.split_header = self.width < 64
-        self.name_w = 18 if self.wide else (14 if self.mid else 11)
-        self.spark_w = 0 if self.width < 84 else (14 if self.wide else 8)
-        if graph_height == "auto":
-            self.graph_h = 2 if self.height >= 26 else 1
+    Every panel spans the full width. From SPLIT_MIN columns on, each panel is
+    divided down the middle: system and identity on the left, GPU and live
+    measurements on the right. Below that the halves are stacked. Either way
+    every field keeps a fixed column.
+    """
+
+    SPLIT_MIN = 90
+
+    def __init__(self, width: int, height: int, graph_h: int) -> None:
+        self.width = max(40, width)
+        self.height = max(8, height)
+        self.inner = self.width - 4  # inside "│ " ... " │"
+        self.split = self.width >= self.SPLIT_MIN
+        if self.split:
+            self.left_w = (self.inner - 3) // 2
+            self.right_w = self.inner - 3 - self.left_w
+            self.divider_col = 2 + self.left_w + 1
         else:
-            try:
-                self.graph_h = max(1, min(4, int(graph_height)))
-            except (TypeError, ValueError):
-                self.graph_h = 1
+            self.left_w = self.right_w = self.inner
+            self.divider_col = None
+        self.name_w = 18 if self.left_w >= 52 else (14 if self.left_w >= 42 else 11)
+        self.show_pid = self.left_w >= 62
+        self.graph_h = graph_h
+
+
+MEM_KIND = {"GPU": "GPU", "part GPU": "GPU", "RAM": "RAM", "RSS": "RSS"}
+LABEL_W = 5  # "CPU  "
+BOX_STYLE = {"system": "b_system", "llama": "b_llama",
+             "ollama": "b_ollama", "lemonade": "b_lemonade"}
 
 
 class Renderer:
     def __init__(self, ascii_mode: bool, graph_height: str | int = "auto") -> None:
         self.ascii = ascii_mode
         self.graph_height = graph_height
-        self.dot_on = "*" if ascii_mode else "●"
-        self.dot_off = "o" if ascii_mode else "○"
-        self.sep = "-" if ascii_mode else "─"
-        self.mid = "|" if ascii_mode else "·"
+        if ascii_mode:
+            self.dot_on, self.dot_off, self.mid = "*", "o", "|"
+            self.h, self.v = "-", "|"
+            self.corners = ("+", "+", "+", "+")
+            self.tees = ("+", "+")
+            self.tab_top = self.tab_bottom = ("[", "]")
+        else:
+            self.dot_on, self.dot_off, self.mid = "●", "○", "·"
+            self.h, self.v = "─", "│"
+            self.corners = ("╭", "╮", "╰", "╯")
+            self.tees = ("┬", "┴")
+            self.tab_top = ("┐", "┌")      # ┐title┌ like btop
+            self.tab_bottom = ("┘", "└")   # ┘title└
         self.graphs: dict[str, Graph] = {}
         self._last_fed = -1.0
 
@@ -1539,284 +1638,440 @@ class Renderer:
                     if not g.seen and k.startswith("tps:")]:
             del self.graphs[key]
 
-    # -- building blocks ---------------------------------------------------
+    # -- panels -------------------------------------------------------------
+
+    def _border(self, lay: Layout, top: bool, style: str,
+                left: list[Seg] | None = None, center: list[Seg] | None = None,
+                right: list[Seg] | None = None) -> list[Seg]:
+        """A panel edge with optional title tabs set into the line."""
+        width = lay.width
+        chars = [self.h] * width
+        styles = [style] * width
+        tl, tr, bl, br = self.corners
+        chars[0], chars[-1] = (tl, tr) if top else (bl, br)
+        if lay.divider_col is not None:
+            chars[lay.divider_col] = self.tees[0] if top else self.tees[1]
+        opening, closing = self.tab_top if top else self.tab_bottom
+        taken: list[tuple[int, int]] = []
+
+        def place(segs: list[Seg] | None, where: str) -> None:
+            if not segs:
+                return
+            cells = [(opening, style)]
+            for text, sty in segs:
+                cells.extend((ch, sty) for ch in text)
+            cells.append((closing, style))
+            n = len(cells)
+            pos = {"left": 2, "right": width - 2 - n, "center": (width - n) // 2}[where]
+            if where == "center":
+                # Centre in the space the side tabs leave, keeping one line
+                # character on either side.
+                lo = max([b + 1 for a, b in taken if a < width // 2] + [2])
+                hi = min([a - 1 for a, b in taken if a >= width // 2] + [width - 2])
+                if hi - lo < n:
+                    return
+                pos = min(max(pos, lo), hi - n)
+            if pos < 1 or pos + n > width - 1:
+                return
+            if any(pos < b and a < pos + n for a, b in taken):
+                return  # would collide with a tab placed earlier
+            for i, (ch, sty) in enumerate(cells):
+                chars[pos + i], styles[pos + i] = ch, sty
+            taken.append((pos, pos + n))
+
+        # Priority when space is short: left title, then right, then center.
+        place(left, "left")
+        place(right, "right")
+        place(center, "center")
+
+        segs: list[Seg] = []
+        for ch, sty in zip(chars, styles):
+            if segs and segs[-1][1] == sty:
+                segs[-1] = (segs[-1][0] + ch, sty)
+            else:
+                segs.append((ch, sty))
+        return segs
+
+    def _panel(self, lay: Layout, style: str, left: list[list[Seg]],
+               right: list[list[Seg]], top: dict, bottom: dict) -> list[list[Seg]]:
+        rows = [self._border(lay, True, style, **top)]
+        edge = (self.v, style)
+        if lay.split:
+            blank_l = [(" " * lay.left_w, "")]
+            blank_r = [(" " * lay.right_w, "")]
+            for i in range(max(len(left), len(right))):
+                rows.append([edge, (" ", ""),
+                             *(left[i] if i < len(left) else blank_l),
+                             (f" {self.v} ", style),
+                             *(right[i] if i < len(right) else blank_r),
+                             (" ", ""), edge])
+        else:
+            for row in (*left, *right):
+                rows.append([edge, (" ", ""), *row, (" ", ""), edge])
+        rows.append(self._border(lay, False, style, **bottom))
+        return rows
+
+    # -- system panel ------------------------------------------------------
 
     def _meter_segs(self, pct: float | None, width: int) -> list[Seg]:
         return meter(pct, width, self.ascii)
 
-    def _pct_seg(self, value: float | None) -> Seg:
+    @staticmethod
+    def _pct_seg(value: float | None) -> Seg:
+        """Always five characters wide."""
         if value is None:
             return ("    -", "dim")
         return (f"{value:4.0f}%", grad_style(value / 100.0))
 
-    def _metric_block(self, key: str, label: str, value: float | None,
-                      lay: Layout, right: list[Seg], live: bool) -> list[list[Seg]]:
-        """One labelled metric: a history graph when live, a meter otherwise."""
-        pad = " " * (len(label) + 1)
-        if not live:
-            line = Line(lay.width)
-            line.add(f"{label} ", "label")
-            line.add_segs(self._meter_segs(value, lay.graph_w))
-            line.add(" ")
-            line.add(*self._pct_seg(value))
-            line.add_segs(right)
-            return [line.segs]
-        rows = self.graph(key).render(lay.graph_w, lay.graph_h, 100.0, self.ascii)
-        out: list[list[Seg]] = []
-        for i, grow in enumerate(rows):
-            line = Line(lay.width)
-            line.add(f"{label} " if i == 0 else pad, "label")
-            line.add_segs(grow)
+    def _graph_rows(self, key: str, label: str, value: float | None, width: int,
+                    lay: Layout, live: bool) -> list[list[Seg]]:
+        """Label, history graph (or meter when not live), percentage."""
+        graph_w = max(4, width - LABEL_W - 6)
+        if live:
+            body = self.graph(key).render(graph_w, lay.graph_h, 100.0, self.ascii)
+        else:
+            body = [self._meter_segs(value, graph_w)]
+        rows = []
+        for i, cells in enumerate(body):
+            line = Line(width)
+            line.add(f"{label:<4} " if i == 0 else " " * LABEL_W, "label")
+            line.add_segs(cells)
             if i == 0:
                 line.add(" ")
                 line.add(*self._pct_seg(value))
-                line.add_segs(right)
-            out.append(line.segs)
-        return out
-
-    def _side_meter(self, label: str, pct: float | None, text: str,
-                    lay: Layout) -> list[Seg]:
-        segs: list[Seg] = [(f"   {label} ", "label")]
-        segs.extend(self._meter_segs(pct, lay.meter_w))
-        segs.append((f" {text}", ""))
-        return segs
-
-    def _own_line(self, segs: list[Seg], lay: Layout) -> list[Seg]:
-        """Put side info on its own row, without the inline indent."""
-        if not segs:
-            return []
-        first, style = segs[0]
-        line = Line(lay.width)
-        line.add_segs([(first.lstrip(), style), *segs[1:]])
-        return line.segs
-
-    def _rule(self, title: str, width: int) -> list[Seg]:
-        pad = max(0, width - len(title) - 5)
-        return [(f"{self.sep}{self.sep} ", "dim"), (title, "title"),
-                (" " + self.sep * pad, "dim")]
-
-    # -- header ------------------------------------------------------------
-
-    def _header(self, snap: Snapshot, lay: Layout, live: bool) -> list[list[Seg]]:
-        sysinfo, gpu, npu = snap.system, snap.gpu, snap.npu
-        rows: list[list[Seg]] = []
-
-        title = Line(lay.width)
-        title.add("llmtop", "title")
-        if not lay.narrow:
-            title.add(f" {VERSION}", "dim")
-        title.add("  ")
-        title.add(os.uname().nodename, "hi")
-        if sysinfo.get("uptime"):
-            title.add(f"  up {human_delta(sysinfo['uptime'])}", "dim")
-        if sysinfo.get("load") and not lay.narrow:
-            title.add("  load " + " ".join(sysinfo["load"]), "dim")
-        rows.append(title.segs)
-
-        ram_segs: list[Seg] = []
-        if sysinfo.get("mem_total"):
-            used, total = sysinfo.get("mem_used"), sysinfo["mem_total"]
-            pct = used / total * 100 if used else None
-            ram_segs = self._side_meter(
-                "RAM", pct, f"{human_bytes(used)}/{human_bytes(total)}", lay)
-        rows.extend(self._metric_block("cpu", "CPU", sysinfo.get("cpu"), lay,
-                                       [] if lay.split_header else ram_segs, live))
-        if lay.split_header and ram_segs:
-            rows.append(self._own_line(ram_segs, lay))
-
-        if gpu:
-            side: list[Seg] = []
-            if gpu.get("gtt_total"):
-                used = gpu.get("gtt_used") or 0
-                side = self._side_meter(
-                    "GTT", used / gpu["gtt_total"] * 100,
-                    f"{human_bytes(used)}/{human_bytes(gpu['gtt_total'])}", lay)
-            elif gpu.get("vram_total"):
-                used = gpu.get("vram_used") or 0
-                side = self._side_meter(
-                    "VRAM", used / gpu["vram_total"] * 100,
-                    f"{human_bytes(used)}/{human_bytes(gpu['vram_total'])}", lay)
-            if gpu.get("temp"):
-                side.append((f"  {gpu['temp']:.0f}°C", "dim"))
-            if gpu.get("watt"):
-                side.append((f" {gpu['watt']:.0f}W", "dim"))
-            if lay.wide and gpu.get("name") and gpu["name"] != "AMD GPU":
-                side.append((f"  {gpu['name']}", "dim"))
-            rows.extend(self._metric_block("gpu", "GPU", gpu.get("busy"), lay,
-                                           [] if lay.split_header else side, live))
-            if lay.split_header and side:
-                rows.append(self._own_line(side, lay))
-
-        if npu:
-            line = Line(lay.width)
-            line.add("NPU ", "label")
-            users = npu.get("users") or []
-            if npu.get("busy") is not None:
-                line.add_segs(self._meter_segs(npu["busy"], lay.meter_w))
-                line.add(" ")
-                line.add(*self._pct_seg(npu["busy"]))
-            elif users:
-                line.add_clipped("in use by " + ", ".join(c for _, c in users[:3]), "ok")
-            else:
-                line.add("idle", "idle")
-            meta = []
-            if npu.get("driver"):
-                meta.append(npu["driver"])
-            if npu.get("fw"):
-                meta.append(f"fw {npu['fw']}")
-            if npu.get("power_state"):
-                meta.append(npu["power_state"])
-            if lay.wide and npu.get("name"):
-                meta.append(npu["name"])
-            if meta:
-                line.add_clipped("   " + f" {self.mid} ".join(meta), "dim")
-            rows.append(line.segs)
+            rows.append(line.padded())
         return rows
 
-    # -- backends ----------------------------------------------------------
+    def _meter_row(self, label: str, used: float | None, total: float | None,
+                   width: int, tail: str = "") -> list[Seg]:
+        pct = (used or 0) / total * 100 if total else None
+        text = f"{human_bytes(used)}/{human_bytes(total)}".rjust(19)
+        meter_w = max(4, width - LABEL_W - 1 - len(text) - len(tail))
+        line = Line(width)
+        line.add(f"{label:<4} ", "label")
+        line.add_segs(self._meter_segs(pct, meter_w))
+        line.add(" " + text)
+        line.add(tail, "dim")
+        return line.padded()
 
-    def _backend(self, be: Backend, lay: Layout, indent: int,
-                 live: bool) -> list[list[Seg]]:
-        pad = " " * (2 + indent)
-        name_w = max(8, lay.name_w - indent)
-        dot = self.dot_on if be.state == RUNNING else self.dot_off
+    def _text_row(self, width: int, label: str, text: str, style: str = "dim") -> list[Seg]:
+        line = Line(width)
+        line.add(f"{label:<4} ", "label")
+        line.add_clipped(text, style)
+        return line.padded()
+
+    def _npu_row(self, npu: dict, width: int) -> list[Seg]:
+        line = Line(width)
+        line.add("NPU  ", "label")
+        users = npu.get("users") or []
+        if npu.get("busy") is not None:
+            line.add_segs(self._meter_segs(npu["busy"], 8))
+            line.add(" ")
+            line.add(*self._pct_seg(npu["busy"]))
+        elif users:
+            line.add(fit("in use: " + ", ".join(c for _, c in users[:3]), 14), "ok")
+        else:
+            line.add(fit("idle", 14), "idle")
+        meta = [m for m in (npu.get("driver"),
+                            f"fw {npu['fw']}" if npu.get("fw") else None,
+                            npu.get("power_state")) if m]
+        line.add_clipped(f" {self.mid} ".join(meta), "dim")
+        return line.padded()
+
+    def _system_panel(self, snap: Snapshot, lay: Layout, live: bool) -> list[list[Seg]]:
+        sysinfo, gpu, npu = snap.system, snap.gpu, snap.npu
+
+        cpu_name = sysinfo.get("cpu_name") or "CPU"
+        if sysinfo.get("threads"):
+            cpu_name += f" {self.mid} {sysinfo['threads']} threads"
+        left = [self._text_row(lay.left_w, "", cpu_name, "label")]
+        left += self._graph_rows("cpu", "CPU", sysinfo.get("cpu"), lay.left_w, lay, live)
+        if sysinfo.get("mem_total"):
+            left.append(self._meter_row("RAM", sysinfo.get("mem_used"),
+                                        sysinfo["mem_total"], lay.left_w))
+        if sysinfo.get("load"):
+            left.append(self._text_row(lay.left_w, "load", "  ".join(sysinfo["load"]), ""))
+
+        right: list[list[Seg]] = []
+        if gpu:
+            name = gpu.get("name") or "GPU"
+            if gpu.get("sclk"):
+                name += f" {self.mid} {gpu['sclk']}"
+            right.append(self._text_row(lay.right_w, "", name, "label"))
+            right += self._graph_rows("gpu", "GPU", gpu.get("busy"), lay.right_w, lay, live)
+            tail = ""
+            if gpu.get("temp") is not None or gpu.get("watt") is not None:
+                temp = f"{gpu['temp']:4.0f}°C" if gpu.get("temp") is not None else " " * 6
+                watt = f"{gpu['watt']:5.0f}W" if gpu.get("watt") is not None else " " * 6
+                tail = f" {temp}{watt}"
+            if gpu.get("gtt_total"):
+                right.append(self._meter_row("GTT", gpu.get("gtt_used"),
+                                             gpu["gtt_total"], lay.right_w, tail))
+            elif gpu.get("vram_total"):
+                right.append(self._meter_row("VRAM", gpu.get("vram_used"),
+                                             gpu["vram_total"], lay.right_w, tail))
+        if npu:
+            right.append(self._npu_row(npu, lay.right_w))
+
+        host: list[Seg] = [(sysinfo.get("host") or os.uname().nodename, "hi")]
+        uptime = f"up {human_delta(sysinfo['uptime'])}" if sysinfo.get("uptime") else ""
+        if sysinfo.get("machine"):
+            full = sum(len(t) for t, _ in host) + 3 + len(sysinfo["machine"])
+            # host tab + clock tab + uptime tab, each with tab chars and gaps
+            if full + 2 + 10 + len(uptime) + 2 + 10 <= lay.width:
+                host += [(f" {self.mid} ", "dim"), (sysinfo["machine"], "label")]
+        top = {"left": host,
+               "center": [(time.strftime("%H:%M:%S"), "clock")],
+               "right": [(uptime, "label")] if uptime else None}
+        return self._panel(lay, BOX_STYLE["system"], left, right, top, {})
+
+    # -- backend panels ----------------------------------------------------
+
+    @staticmethod
+    def _timer(be: Backend) -> Seg:
+        if be.state == SLEEPING and be.since is not None:
+            return (f"idle {human_delta(be.since)}", "dim")
+        if be.idle_in is not None and not be.busy:
+            if be.idle_in > 0:
+                return (f"unloads in {human_delta(be.idle_in)}",
+                        "warn" if be.idle_in < 120 else "dim")
+            return ("unloaded", "dim")
+        if be.last_use is not None and not be.busy:
+            return (f"used {human_delta(be.last_use)} ago", "dim")
+        if be.since is not None and be.state == RUNNING:
+            return (f"up {human_delta(be.since)}", "dim")
+        return ("", "")
+
+    def _backend_left(self, be: Backend, lay: Layout, indent: int) -> list[list[Seg]]:
+        width = lay.left_w
+        running = be.state == RUNNING
         style = STATE_STYLE.get(be.state, "dim")
 
-        head = Line(lay.width)
-        head.add(pad)
-        head.add(dot + " ", style)
-        head.add(be.name[:name_w].ljust(name_w) + " ",
-                 "hi" if be.state == RUNNING else "")
-        head.add(STATE_WORD.get(be.state, be.state).ljust(8) + " ", style)
-        if be.busy:
-            head.add("busy ", "bad")
-        if be.detail and not (be.busy and be.detail.lower() in
-                              ("busy", "processing", "streaming")):
-            head.add_clipped(be.detail + "  ", "dim", minimum=8)
-        if be.port:
-            head.add(f":{be.port} ", "dim")
-        if be.pid and not lay.narrow:
-            head.add(f"pid {be.pid} ", "dim")
-        if be.since is not None and be.state in (RUNNING, SLEEPING):
-            head.add(("up " if be.state == RUNNING else "idle ")
-                     + human_delta(be.since), "dim")
-        rows = [head.segs]
-        if be.state == ABSENT:
-            return rows
+        head = Line(width)
+        head.add(" " * indent)
+        head.add((self.dot_on if running else self.dot_off) + " ", style)
+        # Children lose their indent from the name column, so the state column
+        # lines up for parents and children alike.
+        head.add(fit(be.name, max(8, lay.name_w - indent)) + " ", "hi" if running else "")
+        head.add(fit(STATE_WORD.get(be.state, be.state), 8) + " ", style)
+        head.add("busy " if be.busy else "     ", "bad")
+        head.add(fit(f":{be.port}" if be.port else "", 7), "dim")
+        if lay.show_pid:
+            head.add(fit(f"pid {be.pid}" if be.pid else "", 12), "dim")
+        detail = be.detail
+        if be.busy and detail.lower() in ("busy", "processing", "streaming"):
+            detail = ""
+        head.add_clipped(detail, "dim")
 
-        info = " " * (4 + indent)
-        second = Line(lay.width)
-        second.add(info)
-        second.add_clipped(be.model, "model", minimum=8)
-        bits: list[Seg] = []
-        if be.ctx:
-            bits.append((f"ctx {human_ctx(be.ctx)}", ""))
-        if be.gpu_mem:
-            bits.append((f"{human_bytes(be.gpu_mem)} GPU", ""))
-            if be.mem:
-                bits.append((f"{human_bytes(be.mem)} RSS", "dim"))
-        elif be.mem:
-            bits.append((f"{human_bytes(be.mem)} {be.mem_kind}".strip(), ""))
+        model = Line(width)
+        model.add(" " * (2 + indent))
+        model.add_clipped(be.model, "model", minimum=6)
         for extra in be.extras:
-            bits.append((extra, "dim"))
-        for text, sty in bits:
-            if not second.add_segs([(f" {self.mid} ", "dim"), (text, sty)]):
+            if not model.add_segs([(f" {self.mid} ", "dim"), (extra, "dim")]):
                 break
-        rows.append(second.segs)
+        return [head.padded(), model.padded()]
 
-        third = Line(lay.width)
-        third.add(info)
-        before = third.used
-        if be.cpu is not None:
-            third.add("cpu ", "label")
-            third.add(f"{be.cpu:5.1f}%", grad_style(be.cpu / 100.0))
-        if be.gpu_util is not None:
-            third.add("   gpu ", "label")
-            third.add(f"{be.gpu_util:5.1f}%", grad_style(be.gpu_util / 100.0))
-        if be.slots_total:
-            third.add("   slots ", "label")
-            third.add(f"{be.slots_busy}/{be.slots_total}",
-                      "bad" if be.slots_busy else "")
-        if be.tps is not None:
-            third.add("   ")
-            third.add(f"{be.tps:.1f} tok/s", "bad" if be.tps > 0.05 else "dim")
-            if live and lay.spark_w and third.left > lay.spark_w + 12:
-                g = self.graph(f"tps:{be.key}")
-                spark = g.render(lay.spark_w, 1, g.scale(10.0), self.ascii)
-                third.add(" ")
-                third.add_segs(spark[0])
-        if be.last_use is not None and not be.busy:
-            third.add(f"   last used {human_delta(be.last_use)} ago", "dim")
-        if be.idle_in is not None:
-            word = "unloads in" if be.idle_in > 0 else "unloaded"
-            third.add(f"   {word} {human_delta(abs(be.idle_in))}",
-                      "warn" if 0 < be.idle_in < 120 else "dim")
-        if third.used > before:
-            rows.append(third.segs)
-        return rows
+    def _backend_right(self, be: Backend, lay: Layout,
+                       live: bool) -> list[tuple[list[Seg], bool]]:
+        width = lay.right_w
+        indent = "" if lay.split else "  "
+
+        # line 1: cpu | gpu | tok/s | sparkline
+        load = Line(width)
+        has_load = be.cpu is not None or be.gpu_util is not None or be.tps is not None
+        if has_load:
+            load.add(indent)
+            for label, value in (("cpu ", be.cpu), ("  gpu ", be.gpu_util)):
+                load.add(label, "label")
+                if value is None:
+                    load.add("     -", "dim")
+                else:
+                    load.add(f"{value:5.1f}%", grad_style(value / 100.0))
+            load.add("  ")
+            if be.tps is None:
+                load.add(f"{'-':>6} tok/s", "dim")
+            else:
+                load.add(f"{be.tps:6.1f} tok/s", "bad" if be.tps > 0.05 else "dim")
+                spark_w = load.left - 1
+                if live and spark_w >= 4:
+                    g = self.graph(f"tps:{be.key}")
+                    load.add(" ")
+                    load.add_segs(g.render(spark_w, 1, g.scale(10.0), self.ascii)[0])
+
+        # line 2: memory | ctx | slots | timer
+        size = Line(width)
+        mem, kind = ((be.gpu_mem, "GPU") if be.gpu_mem
+                     else (be.mem, MEM_KIND.get(be.mem_kind, "")))
+        timer = self._timer(be)
+        has_size = bool(mem or be.ctx or be.slots_total or timer[0])
+        if has_size:
+            size.add(indent)
+            size.add(f"{human_bytes(mem) if mem else '-':>9} {kind:<3}",
+                     "" if mem else "dim")
+            size.add("  ctx ", "label")
+            size.add(f"{human_ctx(be.ctx) if be.ctx else '-':>5}", "" if be.ctx else "dim")
+            size.add("  slots ", "label")
+            slots = f"{be.slots_busy}/{be.slots_total}" if be.slots_total else "-"
+            size.add(f"{slots:>5}", "bad" if be.slots_busy else ("" if be.slots_total else "dim"))
+            size.add("  ")
+            size.add_clipped(*timer)
+        return [(load.padded(), has_load), (size.padded(), has_size)]
+
+    @staticmethod
+    def _summary(group: list[Backend]) -> str:
+        counts: dict[str, int] = {}
+        for be in group:
+            counts[be.state] = counts.get(be.state, 0) + 1
+            for child in be.children:
+                if child.busy:
+                    counts["busy"] = counts.get("busy", 0) + 1
+            if be.busy and not be.children:
+                counts["busy"] = counts.get("busy", 0) + 1
+        order = ("busy", RUNNING, SLEEPING, STOPPED, ABSENT)
+        words = {"busy": "busy", **STATE_WORD}
+        return " · ".join(f"{counts[k]} {words[k]}" for k in order if counts.get(k))
 
     # -- everything --------------------------------------------------------
 
     def rows(self, snap: Snapshot, width: int, height: int, interval: float,
              live: bool) -> list[list[Seg]]:
-        lay = Layout(width, height, self.graph_height)
-        out: list[list[Seg]] = []
-        out.extend(self._header(snap, lay, live))
-        out.append([])
+        if self.graph_height == "auto":
+            # Tall graphs when they fit, otherwise flatten them before the
+            # bottom panels get cut off.
+            out = self._build(snap, Layout(width, height, 2), interval, live)
+            if len(out) <= height:
+                return out
+            return self._build(snap, Layout(width, height, 1), interval, live)
+        try:
+            gh = max(1, min(4, int(self.graph_height)))
+        except (TypeError, ValueError):
+            gh = 1
+        return self._build(snap, Layout(width, height, gh), interval, live)
+
+    def _build(self, snap: Snapshot, lay: Layout, interval: float,
+               live: bool) -> list[list[Seg]]:
+        out = self._system_panel(snap, lay, live)
         by_kind: dict[str, list[Backend]] = {}
         for be in snap.backends:
             by_kind.setdefault(be.kind, []).append(be)
-        for kind in ("llama", "ollama", "lemonade"):
-            group = by_kind.get(kind) or []
-            if not group:
-                continue
-            out.append(self._rule(KIND_TITLE[kind], lay.width))
-            for be in group:
-                out.extend(self._backend(be, lay, 0, live))
-                for child in be.children:
-                    out.extend(self._backend(child, lay, 2, live))
-            out.append([])
-        if not any(by_kind.values()):
-            out.append([("  no backend found.", "dim")])
-        foot = Line(lay.width)
-        foot.add(f"  every {interval:g}s", "dim")
+        kinds = [k for k in ("llama", "ollama", "lemonade") if by_kind.get(k)]
+
+        keys: list[Seg] = []
         if live:
-            foot.add("   q quit   +/- interval   r refresh", "dim")
-        out.append(foot.segs)
+            for key, word in (("q", " quit  "), ("+/-", " interval  "), ("r", " refresh")):
+                keys += [(key, "hi"), (word, "label")]
+        footer = {"left": keys or None,
+                  "right": [(f"llmtop {VERSION} {self.mid} every {interval:g}s", "label")]}
+
+        if not kinds:
+            out += self._panel(lay, BOX_STYLE["system"],
+                               [Line(lay.left_w).padded()], [],
+                               {"left": [("backends", "title")]}, footer)
+            return out
+        for n, kind in enumerate(kinds):
+            group = by_kind[kind]
+            left: list[list[Seg]] = []
+            right: list[list[Seg]] = []
+            for be in group:
+                for node, indent in ((be, 0), *((c, 2) for c in be.children)):
+                    lrows = self._backend_left(node, lay, indent)
+                    rrows = self._backend_right(node, lay, live)
+                    if lay.split:
+                        left.extend(lrows)
+                        right.extend(r for r, _ in rrows)
+                    else:
+                        # Stacked: keep each backend's lines together.
+                        left.extend(lrows)
+                        left.extend(r for r, has in rrows if has)
+            top = {"left": [(KIND_TITLE[kind], "title")],
+                   "right": [(self._summary(group), "label")]}
+            out += self._panel(lay, BOX_STYLE[kind], left, right, top,
+                               footer if n == len(kinds) - 1 else {})
         return out
+
+
+# --------------------------------------------------------------------------
+# colours
+# --------------------------------------------------------------------------
+
+DEFAULT_BACKGROUND = 234  # xterm-256 dark grey
+BASE_FG = 252
+
+# style -> (xterm-256 foreground, 8-colour fallback, attribute)
+PALETTE: dict[str, tuple[int, str | None, str]] = {
+    "":           (BASE_FG, None, ""),
+    "dim":        (243, None, "dim"),
+    "label":      (246, None, ""),
+    "hi":         (255, None, "bold"),
+    "title":      (255, None, "bold"),
+    "clock":      (230, None, "bold"),
+    "ok":         (114, "green", ""),
+    "idle":       (74, "cyan", ""),
+    "warn":       (179, "yellow", ""),
+    "bad":        (203, "red", ""),
+    "model":      (182, "magenta", ""),
+    "track":      (238, None, "dim"),
+    # panel frames, one colour per panel like btop's boxes
+    "b_system":   (65, "green", ""),
+    "b_llama":    (137, "yellow", ""),
+    "b_ollama":   (61, "blue", ""),
+    "b_lemonade": (131, "red", ""),
+}
+
+
+def style_spec(style: str) -> tuple[int, str | None, str]:
+    if style.startswith("grad"):
+        try:
+            idx = int(style[4:])
+        except ValueError:
+            return PALETTE[""]
+        frac = idx / (GRAD_N - 1)
+        return (GRADIENT[idx], "green" if frac < 0.45 else
+                "yellow" if frac < 0.8 else "red", "")
+    return PALETTE.get(style, PALETTE[""])
+
+
+def parse_background(value) -> int | None:
+    """Config/CLI value -> xterm-256 index, or None for the terminal's own."""
+    if value is None:
+        return DEFAULT_BACKGROUND
+    if isinstance(value, int):
+        return value if 0 <= value <= 255 else DEFAULT_BACKGROUND
+    text = str(value).strip().lower()
+    if text in ("", "none", "off", "false", "terminal", "default"):
+        return None
+    try:
+        num = int(text)
+    except ValueError:
+        return DEFAULT_BACKGROUND
+    return num if 0 <= num <= 255 else DEFAULT_BACKGROUND
 
 
 # --------------------------------------------------------------------------
 # output: one-shot, JSON, TUI
 # --------------------------------------------------------------------------
 
-ANSI_BASE = {
-    "": "", "dim": "\033[2m", "ok": "\033[32m", "idle": "\033[36m",
-    "warn": "\033[33m", "bad": "\033[31m", "hi": "\033[1m",
-    "title": "\033[1;34m", "label": "\033[2m", "model": "\033[35m",
-    "track": "\033[38;5;236m",
-}
+def ansi(style: str, background: int | None) -> str:
+    fg, _, attr = style_spec(style)
+    codes = ["0", f"38;5;{fg}"]
+    if background is not None:
+        codes.append(f"48;5;{background}")
+    if attr == "bold":
+        codes.append("1")
+    return f"\033[{';'.join(codes)}m"
 
 
-def ansi_code(style: str) -> str:
-    if style.startswith("grad"):
-        try:
-            return f"\033[38;5;{GRADIENT[int(style[4:])]}m"
-        except (ValueError, IndexError):
-            return ""
-    return ANSI_BASE.get(style, "")
-
-
-def print_rows(rows: list[list[Seg]], color: bool) -> None:
+def print_rows(rows: list[list[Seg]], color: bool, background: int | None,
+               width: int) -> None:
     for row in rows:
         if not color:
             print("".join(text for text, _ in row).rstrip())
             continue
-        parts = []
-        for text, style in row:
-            code = ansi_code(style)
-            parts.append(f"{code}{text}\033[0m" if code else text)
-        print("".join(parts).rstrip())
+        parts = [ansi(style, background) + text for text, style in row]
+        used = sum(len(text) for text, _ in row)
+        if background is not None and used < width:
+            parts.append(ansi("", background) + " " * (width - used))
+        print("".join(parts) + "\033[0m")
 
 
 def backend_to_dict(be: Backend) -> dict:
@@ -1844,48 +2099,40 @@ def snapshot_to_dict(snap: Snapshot) -> dict:
     }
 
 
-def build_pairs(curses) -> dict[str, int]:
-    """Map style names onto curses attributes, gradient included."""
+def build_pairs(curses, background: int | None) -> tuple[dict[str, int], int]:
+    """Map style names onto curses attributes. Returns (pairs, base attribute)."""
     pairs: dict[str, int] = {}
     if not curses.has_colors():
-        return pairs
+        return pairs, 0
     curses.start_color()
     try:
         curses.use_default_colors()
-        background = -1
+        default_bg = -1
     except curses.error:
-        background = curses.COLOR_BLACK
-    spec = {"ok": curses.COLOR_GREEN, "idle": curses.COLOR_CYAN,
-            "warn": curses.COLOR_YELLOW, "bad": curses.COLOR_RED,
-            "title": curses.COLOR_BLUE, "model": curses.COLOR_MAGENTA}
-    index = 1
-    for name, color in spec.items():
-        curses.init_pair(index, color, background)
-        pairs[name] = curses.color_pair(index)
-        index += 1
-    pairs["hi"] = curses.A_BOLD
-    pairs["dim"] = curses.A_DIM
-    pairs["label"] = curses.A_DIM
-    pairs["title"] |= curses.A_BOLD
-    if curses.COLORS >= 256 and curses.COLOR_PAIRS > index + GRAD_N + 1:
-        for i, color in enumerate(GRADIENT):
-            curses.init_pair(index, color, background)
-            pairs[f"grad{i}"] = curses.color_pair(index)
-            index += 1
-        curses.init_pair(index, 236, background)
-        pairs["track"] = curses.color_pair(index)
-    else:
-        # Eight-colour terminals: collapse the gradient onto green/yellow/red.
-        for i in range(GRAD_N):
-            frac = i / (GRAD_N - 1)
-            pairs[f"grad{i}"] = (pairs["ok"] if frac < 0.45 else
-                                 pairs["warn"] if frac < 0.8 else pairs["bad"])
-        pairs["track"] = curses.A_DIM
-    return pairs
+        default_bg = curses.COLOR_BLACK
+    rich = curses.COLORS >= 256
+    bg = background if (rich and background is not None) else default_bg
+    basic = {"green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW,
+             "red": curses.COLOR_RED, "cyan": curses.COLOR_CYAN,
+             "blue": curses.COLOR_BLUE, "magenta": curses.COLOR_MAGENTA}
+    plain = -1 if default_bg == -1 else curses.COLOR_WHITE
+    styles = [*PALETTE, *(f"grad{i}" for i in range(GRAD_N))]
+    for number, style in enumerate(styles, start=1):
+        if number >= curses.COLOR_PAIRS:
+            break
+        fg, fallback, attr = style_spec(style)
+        curses.init_pair(number, fg if rich else basic.get(fallback, plain), bg)
+        value = curses.color_pair(number)
+        if attr == "bold":
+            value |= curses.A_BOLD
+        elif attr == "dim" and not rich:
+            value |= curses.A_DIM
+        pairs[style] = value
+    return pairs, pairs.get("", 0)
 
 
 def run_tui(collector: Collector, interval: float, ascii_mode: bool,
-            graph_height: str | int) -> int:
+            graph_height: str | int, background: int | None) -> int:
     import curses
     import select
     import threading
@@ -1906,7 +2153,8 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool,
     def draw(stdscr) -> int:
         curses.curs_set(0)
         stdscr.nodelay(True)
-        pairs = build_pairs(curses)
+        pairs, base = build_pairs(curses, background)
+        stdscr.bkgd(" ", base)  # paints the background into every cell
         renderer = Renderer(ascii_mode, graph_height)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1935,16 +2183,16 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool,
             height, width = stdscr.getmaxyx()
             stdscr.erase()
             snap = state["snap"]
-            if width < 30 or height < 6:
+            if width < 40 or height < 8:
                 try:
-                    stdscr.addnstr(0, 0, "terminal too small", max(0, width - 1))
+                    stdscr.addnstr(0, 0, "terminal too small", max(0, width - 1), base)
                 except curses.error:
                     pass
             elif snap is None:
-                stdscr.addnstr(0, 0, "llmtop is collecting ...", width - 1)
+                stdscr.addnstr(0, 0, "llmtop is collecting ...", width - 1, base)
             else:
                 renderer.feed(snap)
-                rows = renderer.rows(snap, width - 1, height, state["interval"], True)
+                rows = renderer.rows(snap, width - 1, height - 1, state["interval"], True)
                 for y, row in enumerate(rows):
                     if y >= height - 1:
                         break
@@ -1955,14 +2203,14 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool,
                         chunk = text[: max(0, width - 1 - x)]
                         try:
                             stdscr.addnstr(y, x, chunk, width - 1 - x,
-                                           pairs.get(style, 0))
+                                           pairs.get(style, base))
                         except curses.error:
                             pass
                         x += len(chunk)
             if state["err"]:
                 try:
                     stdscr.addnstr(height - 1, 0, f"error: {state['err']}"[:width - 1],
-                                   width - 1, pairs.get("bad", 0))
+                                   width - 1, pairs.get("bad", base))
                 except curses.error:
                     pass
             stdscr.refresh()
@@ -1988,8 +2236,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="refresh interval in seconds (default 2)")
     parser.add_argument("--graph-height", default=None,
                         help="graph rows: auto (default) or 1-4")
+    parser.add_argument("--background", default=None,
+                        help="xterm-256 background colour index, or 'none' "
+                             f"for the terminal's own (default {DEFAULT_BACKGROUND})")
     parser.add_argument("--ascii", action="store_true",
-                        help="ASCII only, no braille")
+                        help="ASCII only, no braille or box drawing")
     parser.add_argument("--no-color", action="store_true",
                         help="no colour (with --once)")
     parser.add_argument("--config", help="path to a configuration file")
@@ -2000,6 +2251,8 @@ def main(argv: list[str] | None = None) -> int:
     interval = args.interval if args.interval is not None else float(cfg["ui"]["interval"])
     ascii_mode = args.ascii or bool(cfg["ui"].get("ascii"))
     graph_height = args.graph_height or cfg["ui"].get("graph_height", "auto")
+    background = parse_background(args.background if args.background is not None
+                                  else cfg["ui"].get("background"))
     collector = Collector(cfg)
 
     def sampled() -> Snapshot:
@@ -2015,16 +2268,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         size = shutil.get_terminal_size((100, 30))
         color = sys.stdout.isatty() and not args.no_color
-        rows = Renderer(ascii_mode, graph_height).rows(
-            sampled(), size.columns - 1, size.lines, interval, False)
-        print_rows(rows, color)
+        width = size.columns - 1
+        # One-shot output is not bound by the window height.
+        rows = Renderer(ascii_mode, graph_height if graph_height != "auto" else 1).rows(
+            sampled(), width, 10_000, interval, False)
+        print_rows(rows, color, background, width)
         return 0
 
     if not sys.stdout.isatty():
         print("llmtop: not a terminal, use --once or --json", file=sys.stderr)
         return 2
     try:
-        return run_tui(collector, interval, ascii_mode, graph_height)
+        return run_tui(collector, interval, ascii_mode, graph_height, background)
     except KeyboardInterrupt:
         return 0
 

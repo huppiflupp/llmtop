@@ -4,30 +4,38 @@ An htop-style overview of local LLM backends — **llama.cpp**, **Ollama** and
 **Lemonade Server** — showing which model is loaded, what it costs in memory and
 what is going through it right now, plus integrated GPU and NPU state.
 
-Braille history graphs with a colour gradient, like btop. One file, Python 3.11+,
-no dependencies.
+Drawn like btop: framed panels with titles set into the border, braille history
+graphs with a colour gradient, a clock, and a background of its own. One file,
+Python 3.11+, no dependencies.
 
 ```
-llmtop 0.2.0  workstation  up 1d16h  load 0.02 0.41 1.07
-CPU ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀    3%   RAM ⣿⣿⣿⣿⣿⡇⣀⣀⣀⣀⣀⣀⣀⣀ 49.1 GiB/124.9 GiB
-    ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀
-GPU ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣿⣿⣿⣶⣶⣶   88%   GTT ⣿⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 41.9 GiB/120.0 GiB  56°C 85W
-    ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿
-NPU idle   amdxdna · fw 1.1.2.65 · D3hot · AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
-
-── llama.cpp ──────────────────────────────────────────────────────────────────
-  ● llama-qwen         running  :8091 pid 3168734 up 1m54
-    qwen3-30b-a3b · ctx 32k · 18.5 GiB GPU · 98.8 MiB RSS · fa · ngl 999
-    cpu  32.8%   gpu  97.9%   slots 1/1   36.2 tok/s ⣀⣠⣴⣶⣿⣿⣷
-  ○ llama-qwen36       asleep   socket 8090  :8090 idle 21h19
-    qwen3.6-35b-a3b · ctx 64k · draft draft-mtp · fa · ngl 999
-  ○ llama-v4           stopped  dead
-    deepseek-v4-flash · ctx 64k · ngl 999 · model file missing
-
-── Ollama ─────────────────────────────────────────────────────────────────────
-  ● ollama             running  :11434 pid 3154906 up 24m41
-    granite4.2:latest · ctx 128k · 25.1 GiB GPU · 8.8B · Q4_K_M
-    cpu   0.6%   slots 1/1   54.5 tok/s ⣀⣠⣾⣿⣿⣷⣄   unloads in 29m
+╭─┐tower · GMKtec NucBox EVO-X2┌─────────────────┐11:19:05┌──────────────────────────────────────┐up 1d18h┌─╮
+│      AMD RYZEN AI MAX+ 395 w/ Radeon 8060S · 32 th… │      Radeon 8060S · 2737Mhz                         │
+│ CPU  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀    9% │ GPU  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿  100% │
+│      ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀       │      ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿       │
+│ RAM  ⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀  46.6 GiB/124.9 GiB │ GTT  ⣿⣿⣿⣿⡇⣀⣀⣀⣀⣀⣀⣀⣀  40.3 GiB/120.0 GiB   63°C   85W │
+│ load 1.93  2.27  1.65                               │ NPU  idle          amdxdna · fw 1.1.2.65 · D3hot    │
+╰─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────╯
+╭─┐llama.cpp┌─────────────────────────────────────────┬──────────────────────────────┐2 asleep · 1 stopped┌─╮
+│ ○ llama-qwen     asleep        :8091  socket-activ… │                                                     │
+│   qwen3-30b-a3b · fa · ngl 999                      │         -      ctx   32k  slots     -  idle 2h18    │
+│ ○ llama-qwen36   asleep        :8090  socket-activ… │                                                     │
+│   qwen3.6-35b-a3b · draft draft-mtp · fa · ngl 999  │         -      ctx   64k  slots     -  idle 23h15   │
+│ ○ llama-v4       stopped              dead          │                                                     │
+│   deepseek-v4-flash · ngl 999 · model file missing  │         -      ctx   64k  slots     -               │
+╰─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────╯
+╭─┐Ollama┌────────────────────────────────────────────┬────────────────────────────────┐1 busy · 1 running┌─╮
+│ ● ollama         running  busy :11434               │ cpu 197.1%  gpu      -    23.7 tok/s ⣀⣀⣀⣀⣀⣸⣿⣿⣿⣿⣿⣿⣿⣿ │
+│   granite4.2:latest · v0.34.1-igpu-trust-vram       │  25.1 GiB GPU  ctx  128k  slots   1/1  up 58s       │
+╰─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────╯
+╭─┐Lemonade┌──────────────────────────────────────────┬────────────────────────────────┐1 busy · 1 running┌─╮
+│ ● lemonade       running  busy :13311 front: Gemma… │ cpu   0.0%  gpu      -       - tok/s                │
+│   2 models · v11.6.0 · 188.1k tok total             │ 959.6 MiB RSS  ctx     -  slots     -  up 20h56     │
+│   ● SDXL-Turbo   running       :8002  ready         │ cpu   0.0%  gpu      -       - tok/s                │
+│     SDXL-Turbo · sd-cpp/gpu · image                 │  21.3 MiB RSS  ctx   32k  slots     -  used 2h34 a… │
+│   ● Gemma-4-E4B… running  busy :8001                │ cpu  33.5%  gpu      -    44.5 tok/s ⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│     Gemma-4-E4B-it-GGUF · llamacpp/gpu              │ 938.2 MiB RSS  ctx  128k  slots   2/4               │
+╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.4.0 · every 1s└─╯
 ```
 
 ## Why not just extend btop
@@ -76,15 +84,30 @@ llmtop -n 1             # refresh every second
 llmtop --once           # print once and exit (meters instead of history)
 llmtop --json           # machine readable, for scripts and status bars
 llmtop --graph-height 3 # taller graphs; default adapts to the window
-llmtop --ascii          # no braille, plain ASCII
+llmtop --background 16  # another xterm-256 background, or "none"
+llmtop --ascii          # no braille or box drawing, plain ASCII
 ```
 
 Keys: `q` quit, `+`/`-` interval, `r` refresh now.
 
-The layout follows the window. Graphs and meters grow and shrink with it, columns
-are dropped in priority order when space runs short, and on a narrow terminal the
-memory meters move to lines of their own. Resizing keeps the history: the sample
-buffer is far wider than any terminal, so a wider window simply reveals more past.
+### Layout
+
+Each panel spans the full width and, from 90 columns on, is split down the
+middle: identity and system on the left, GPU and live measurements on the right.
+Every field has a fixed column - values are padded, never shifted - so nothing
+wanders as numbers change length. Below 90 columns the two halves are stacked
+inside the same panels.
+
+Graphs and meters grow and shrink with the window, trailing fields are cut with an
+ellipsis rather than pushed aside, and on short terminals the graphs flatten to
+one row before the bottom panels would get cut off. Resizing keeps the history:
+the sample buffer is far wider than any terminal, so a wider window simply reveals
+more of the past.
+
+The top border carries host and machine name, the clock and uptime; the CPU and
+GPU names head their halves of the system panel. Each backend panel lists a
+summary such as `1 busy · 2 asleep` in its border, and the bottom border carries
+the key bindings.
 
 ## Where the numbers come from
 

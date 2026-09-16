@@ -1,17 +1,18 @@
-# ~/.config/llmtop/config.toml - alle Angaben sind freiwillig.
+# ~/.config/llmtop/config.toml - every entry is optional.
 
 [ui]
-interval = 2.0      # Sekunden zwischen zwei Messungen
-ascii = false       # true: keine Blockzeichen, nur ASCII
+interval = 2.0        # seconds between measurements
+ascii = false         # true: plain ASCII instead of braille
+graph_height = "auto" # "auto", or 1-4 rows per graph
 
 [llama]
-# Nach welchen systemd-Units gesucht wird (Benutzer- und Systemebene).
+# Which systemd units to look for, in the user and system scopes.
 unit_glob_socket = "llama-*.socket"
 unit_glob_service = "llama-*.service"
 
 [ollama]
 url = "http://127.0.0.1:11434"
-# Fuer die Zuordnung Modell <-> Runner-Prozess. Der erste lesbare zaehlt.
+# Used to match a loaded model to its runner process. First readable one wins.
 model_dirs = [
   "/var/lib/ollama/.ollama/models",
   "/usr/share/ollama/.ollama/models",
@@ -19,7 +20,7 @@ model_dirs = [
 ]
 
 [lemonade]
-# Wird aus dem laufenden lemond-Prozess uebernommen, falls dieser --port setzt.
+# Taken from the running lemond process when it passes --port.
 url = "http://127.0.0.1:8000"
 unit = "lemond.service"
 

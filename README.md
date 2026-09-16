@@ -1,68 +1,66 @@
 # llmtop
 
-Eine htop-artige Übersicht über lokale LLM-Backends: **llama.cpp**, **Ollama** und
-**Lemonade Server** — welches Modell geladen ist, was es an Speicher belegt, was
-gerade durchgeht. Dazu iGPU- und NPU-Zustand.
+An htop-style overview of local LLM backends — **llama.cpp**, **Ollama** and
+**Lemonade Server** — showing which model is loaded, what it costs in memory and
+what is going through it right now, plus integrated GPU and NPU state.
 
-*English: a terminal dashboard for locally running LLM servers (llama.cpp, Ollama,
-Lemonade), showing loaded models, memory, live tokens/s, GPU and NPU state. Python
-stdlib only, no dependencies. The UI is in German.*
+Braille history graphs with a colour gradient, like btop. One file, Python 3.11+,
+no dependencies.
 
 ```
-llmtop 0.1.0  workstation  up 1t16h  load 2.60 1.47 1.26
-CPU ██░░░░░░░░░░   16%   RAM 112.1 GiB/124.9 GiB (90%)
-GPU ████████████  100%   GTT 103.9 GiB/120.0 GiB  64°C 85W
-NPU frei  (Auslastung nur via debugfs/root)   amdxdna · FW 1.1.2.65 · D0
+llmtop 0.2.0  workstation  up 1d16h  load 0.02 0.41 1.07
+CPU ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀    3%   RAM ⣿⣿⣿⣿⣿⡇⣀⣀⣀⣀⣀⣀⣀⣀ 49.1 GiB/124.9 GiB
+    ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀
+GPU ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣿⣿⣿⣶⣶⣶   88%   GTT ⣿⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 41.9 GiB/120.0 GiB  56°C 85W
+    ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿
+NPU idle   amdxdna · fw 1.1.2.65 · D3hot · AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
 
-── llama.cpp ─────────────────────────────────────────────────────────────────
-  ● llama-qwen         laeuft   aktiv :8091 pid 3168734 seit 1m54
+── llama.cpp ──────────────────────────────────────────────────────────────────
+  ● llama-qwen         running  :8091 pid 3168734 up 1m54
     qwen3-30b-a3b · ctx 32k · 18.5 GiB GPU · 98.8 MiB RSS · fa · ngl 999
-    CPU  32.8%   GPU  97.9%   Slots 1/1   36.2 tok/s
-  ○ llama-qwen36       schlaeft Socket 8090  :8090 ruht 20h56
+    cpu  32.8%   gpu  97.9%   slots 1/1   36.2 tok/s ⣀⣠⣴⣶⣿⣿⣷
+  ○ llama-qwen36       asleep   socket 8090  :8090 idle 21h19
     qwen3.6-35b-a3b · ctx 64k · draft draft-mtp · fa · ngl 999
-  ○ llama-v4           gestoppt dead
-    deepseek-v4-flash · ctx 64k · ngl 999 · Modelldatei fehlt
+  ○ llama-v4           stopped  dead
+    deepseek-v4-flash · ctx 64k · ngl 999 · model file missing
 
-── Ollama ────────────────────────────────────────────────────────────────────
-  ● ollama             laeuft   :11434 pid 3154906 seit 24m41
+── Ollama ─────────────────────────────────────────────────────────────────────
+  ● ollama             running  :11434 pid 3154906 up 24m41
     granite4.2:latest · ctx 128k · 25.1 GiB GPU · 8.8B · Q4_K_M
-    CPU   0.6%   Slots 1/1   54.5 tok/s   entlaedt in 29m
+    cpu   0.6%   slots 1/1   54.5 tok/s ⣀⣠⣾⣿⣿⣷⣄   unloads in 29m
 ```
 
-## Warum nicht einfach btop
+## Why not just extend btop
 
-btop hat keine Erweiterungsschnittstelle — `shown_boxes` akzeptiert ausschließlich
-`cpu mem net proc` und `gpu0`…`gpu5`, die Boxen stecken fest im C++-Quelltext. Eine
-eigene Box bedeutet einen Fork, der bei jedem Release neu rebasiert werden will.
-llmtop läuft deshalb *neben* btop statt darin.
+btop has no extension point — `shown_boxes` accepts only `cpu mem net proc` and
+`gpu0`…`gpu5`, and the boxes are hard-wired in its C++ source. A box of your own
+means a fork that needs rebasing on every release. So llmtop runs *next to* btop
+rather than inside it, and borrows its look: braille graphs, gradient colours,
+meters that fill left to right.
 
-Für Ollama allein gibt es bereits gute Werkzeuge —
+For Ollama alone there are already good tools —
 [otop](https://github.com/TiniLLM/ollama-token-monitor),
 [ollama-tui](https://github.com/hughdbrown/ollama-tui),
-[OllamaManager](https://github.com/tleclaire/OllamaManager). Keines davon kennt
-llama.cpp oder Lemonade, und keines ist auf Socket-Aktivierung vorbereitet.
+[OllamaManager](https://github.com/tleclaire/OllamaManager). None of them knows
+about llama.cpp or Lemonade, and none is prepared for socket activation.
 
-## Socket-aktivierte Backends
+## Socket-activated backends
 
-Das ist der Grund, warum ein allgemeines Werkzeug hier nicht genügt: Hängt ein
-llama.cpp-Backend an einer `systemd`-Socket-Unit, **löst schon ein Statuscheck per
-HTTP das Laden des Modells aus** — bei einem 35B-Modell zwanzig Sekunden und zwanzig
-Gigabyte für die Frage „läuft das gerade?".
+This is why a generic tool is not enough here. When a llama.cpp backend hangs off
+a `systemd` socket unit, **an HTTP status check is itself enough to load the
+model** — twenty seconds and twenty gigabytes to answer "is this running?".
 
-llmtop fragt Socket-Ports grundsätzlich nicht an. Der Zustand kommt aus systemd, und
-Messwerte holt es ausschließlich vom internen Backend-Port, und nur dann, wenn der
-Dienst ohnehin schon läuft. Die Socket-Ports stehen vor dem ersten HTTP-Aufruf auf
-einer Sperrliste.
+llmtop never talks to a socket port. State comes from systemd, and measurements
+only from the internal backend port, and only while the service is already up.
+The socket ports go on a block list before the first HTTP call is made.
 
-Modell, Kontextgröße und Optionen eines *schlafenden* Backends liest llmtop aus der
-Unit: `ExecStart` über `systemctl show` (dort sind `%h` und Co. bereits aufgelöst),
-und zeigt die Zeile auf ein Startskript, wird dessen Inhalt ausgewertet — auch wenn
-die Argumente darin erst in einem Bash-Array gesammelt werden. Fehlt die Modelldatei
-inzwischen, steht das dabei.
+Model, context size and options of a *sleeping* backend are read from the unit:
+`ExecStart` via `systemctl show` (where `%h` and friends are already expanded),
+and if that points at a start script, the script is parsed — including the case
+where its arguments are collected in a bash array first. If the model file has
+since disappeared, it says so.
 
-## Installation
-
-Eine Datei, Python ≥ 3.11, keine Abhängigkeiten.
+## Install
 
 ```bash
 git clone https://github.com/huppiflupp/llmtop.git
@@ -70,61 +68,67 @@ install -m 755 llmtop/llmtop.py ~/.local/bin/llmtop
 llmtop
 ```
 
-## Aufruf
+## Usage
 
 ```
-llmtop              # TUI
-llmtop -n 1         # Aktualisierung jede Sekunde
-llmtop --once       # einmal ausgeben und beenden
-llmtop --json       # Maschinenlesbar, für Skripte und Statuszeilen
-llmtop --ascii      # ohne Blockzeichen
+llmtop                  # TUI with live graphs
+llmtop -n 1             # refresh every second
+llmtop --once           # print once and exit (meters instead of history)
+llmtop --json           # machine readable, for scripts and status bars
+llmtop --graph-height 3 # taller graphs; default adapts to the window
+llmtop --ascii          # no braille, plain ASCII
 ```
 
-Tasten: `q` beenden, `+`/`-` Intervall, `r` sofort aktualisieren.
+Keys: `q` quit, `+`/`-` interval, `r` refresh now.
 
-## Woher die Zahlen kommen
+The layout follows the window. Graphs and meters grow and shrink with it, columns
+are dropped in priority order when space runs short, and on a narrow terminal the
+memory meters move to lines of their own. Resizing keeps the history: the sample
+buffer is far wider than any terminal, so a wider window simply reveals more past.
 
-| Angabe | Quelle |
+## Where the numbers come from
+
+| Reading | Source |
 |---|---|
-| llama.cpp: Zustand, Modell, Kontext | `systemctl show` auf Service und Socket, Startskript |
-| llama.cpp: Slots, tok/s | `GET /slots` am internen Port, Delta von `n_decoded` |
-| Ollama: Modell, Speicher, Entladezeit | `GET /api/ps` (`size_vram`, `context_length`, `expires_at`) |
-| Ollama: Modell ↔ Runner-Prozess | Manifeste unter `models/manifests`, Blob-Digest der Modellschicht |
-| Lemonade: Modelle, Backends, Leerlauf | `GET /api/v1/health`, `last_use` gegen `/proc/uptime` |
-| Lemonade: Durchsatz | `GET /api/v1/stats`, sonst `/slots` des zugehörigen llama.cpp |
-| Speicher je Prozess | `/proc/<pid>/fdinfo`, `drm-resident-gtt` + `drm-resident-vram` |
-| GPU-Zeit je Prozess | `/proc/<pid>/fdinfo`, Delta von `drm-engine-*` |
-| GPU gesamt | `/sys/class/drm/card*/device`, ersatzweise `nvidia-smi` |
-| NPU | `/sys/class/accel/*`, `xrt-smi examine`, offene `/dev/accel/*` |
+| llama.cpp: state, model, context | `systemctl show` on service and socket, start script |
+| llama.cpp: slots, tok/s | `GET /slots` on the internal port, delta of `n_decoded` |
+| Ollama: model, memory, unload timer | `GET /api/ps` (`size_vram`, `context_length`, `expires_at`) |
+| Ollama: model ↔ runner process | manifests under `models/manifests`, blob digest of the model layer |
+| Lemonade: models, backends, idle time | `GET /api/v1/health`, `last_use` against `/proc/uptime` |
+| Lemonade: throughput | `GET /api/v1/stats`, else `/slots` of the matching llama.cpp |
+| Memory per process | `/proc/<pid>/fdinfo`, `drm-resident-gtt` + `drm-resident-vram` |
+| GPU time per process | `/proc/<pid>/fdinfo`, delta of `drm-engine-*` |
+| GPU overall | `/sys/class/drm/card*/device`, else `nvidia-smi` |
+| NPU | `/sys/class/accel/*`, `xrt-smi examine`, open `/dev/accel/*` handles |
 
-`tokens_predicted_total` aus `/metrics` wird nur als Rückfall benutzt: Der Zähler
-wird erst beim Auftragsende fortgeschrieben und steht während der Generierung still.
-`/slots` zählt dagegen live mit.
+`tokens_predicted_total` from `/metrics` is only a fallback: that counter is
+written when a task finishes and stands still during generation. `/slots` counts
+along live.
 
-### Gemeinsamer Speicher
+### Unified memory
 
-Auf Systemen mit Unified Memory (AMD Strix Halo und Verwandte) liegt das Modell im
-GTT und taucht in RSS **gar nicht** auf — ein 30B-Modell erscheint dort als 99 MiB.
-Erst `drm-resident-gtt` zeigt die echten 18,5 GiB. llmtop weist beides getrennt aus.
+On unified-memory systems (AMD Strix Halo and relatives) the model lives in GTT
+and does **not** appear in RSS at all — a 30B model shows up there as 99 MiB. Only
+`drm-resident-gtt` reveals the real 18.5 GiB. llmtop reports both, separately.
 
-## Grenzen
+## Limits
 
-- **NPU-Auslastung in Prozent** gibt `amdxdna` nur über debugfs heraus, das root
-  braucht. Ohne root zeigt llmtop stattdessen, ob jemand `/dev/accel/*` geöffnet hat,
-  dazu Treiber, Firmware-Stand und Energiezustand.
-- **Speicher und GPU-Zeit je Prozess** stehen nur für eigene Prozesse in `/proc`.
-  Läuft Ollama als eigener Systembenutzer, bleibt für dessen Runner die Angabe aus
-  `/api/ps` übrig — die ist gut, aber gröber.
-- Bei **mehreren gleichzeitig geladenen Ollama-Modellen** klappt die Zuordnung
-  Modell ↔ Prozess nur, wenn die Manifeste lesbar sind.
+- **NPU utilisation in percent** is only exposed by `amdxdna` through debugfs,
+  which needs root. Without it llmtop shows whether anything holds `/dev/accel/*`
+  open, plus driver, firmware version and power state.
+- **Per-process memory and GPU time** are only readable for your own processes.
+  If Ollama runs as its own system user, what remains for its runners is the
+  figure from `/api/ps` — good, but coarser.
+- With **several Ollama models loaded at once**, matching model to process works
+  only when the manifests are readable.
 
-## Konfiguration
+## Configuration
 
-Ohne Konfiguration werden die üblichen Adressen probiert und Dienste anhand ihrer
-Prozesse erkannt; `OLLAMA_HOST`, `OLLAMA_MODELS` und `LEMONADE_URL` werden beachtet.
-Für abweichende Aufbauten: `~/.config/llmtop/config.toml`, siehe
+Without any configuration the usual addresses are tried and services are found by
+their processes; `OLLAMA_HOST`, `OLLAMA_MODELS` and `LEMONADE_URL` are honoured.
+For anything unusual: `~/.config/llmtop/config.toml`, see
 [`config.toml.example`](config.toml.example).
 
-## Lizenz
+## License
 
 MIT

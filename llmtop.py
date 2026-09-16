@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""llmtop - htop-artige Uebersicht ueber lokale LLM-Backends.
+"""llmtop - an htop-style overview of local LLM backends.
 
-Zeigt fuer llama.cpp, Ollama und Lemonade Server an, ob sie laufen, welches
-Modell geladen ist, wie viel Speicher es belegt und was gerade durchgeht.
-Dazu iGPU- und NPU-Auslastung.
+Shows, for llama.cpp, Ollama and Lemonade Server, whether they are up, which
+model is loaded, how much memory it holds and what is going through it right
+now, plus integrated GPU and NPU state.
 
-Nur Standardbibliothek, Python >= 3.11.
+Standard library only, Python >= 3.11.
 
-Wichtig: socket-aktivierte llama.cpp-Backends werden NIE ueber ihren
-Socket-Port abgefragt - das wuerde den Modell-Ladevorgang ausloesen. Der
-Zustand kommt aus systemd, Messwerte nur vom internen Backend-Port und nur
-wenn der Dienst ohnehin schon laeuft.
+Important: socket-activated llama.cpp backends are never probed on their
+socket port - that would trigger a model load just to answer "is it running?".
+State comes from systemd, and measurements only from the internal backend port
+and only while the service is already up.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,14 +35,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+HISTORY = 1024  # samples kept per graph, independent of the drawn width
 
 
 # --------------------------------------------------------------------------
-# kleine Helfer
+# small helpers
 # --------------------------------------------------------------------------
 
 def read_text(path: str | Path) -> str | None:
@@ -93,7 +95,7 @@ def human_bytes(n: float | None, *, digits: int = 1) -> str:
 
 
 def human_ctx(n: int | None) -> str:
-    """Kontextfenster kompakt. 131072 -> 128k, 34630 -> 33.8k."""
+    """Context window, compact. 131072 -> 128k, 34630 -> 33.8k."""
     if not n:
         return "-"
     if n < 1024:
@@ -113,7 +115,7 @@ def human_count(n: int | None) -> str:
 
 
 def human_delta(seconds: float | None) -> str:
-    """Zeitspanne kompakt: 45s, 12m, 3h04, 2t05h."""
+    """Compact duration: 45s, 12m, 3h04, 2d05h."""
     if seconds is None:
         return "-"
     seconds = int(seconds)
@@ -125,11 +127,11 @@ def human_delta(seconds: float | None) -> str:
         return f"{sign}{seconds//60}m{seconds%60:02d}"
     if seconds < 86400:
         return f"{sign}{seconds//3600}h{(seconds%3600)//60:02d}"
-    return f"{sign}{seconds//86400}t{(seconds%86400)//3600:02d}h"
+    return f"{sign}{seconds//86400}d{(seconds%86400)//3600:02d}h"
 
 
 def parse_iso(ts: str | None) -> float | None:
-    """ISO-8601 aus Go/Python zu Unix-Zeit. Nanosekunden werden gekuerzt."""
+    """ISO-8601 from Go/Python to unix time. Nanoseconds get truncated."""
     if not ts:
         return None
     cleaned = re.sub(r"(\.\d{6})\d+", r"\1", ts.replace("Z", "+00:00"))
@@ -142,7 +144,130 @@ def parse_iso(ts: str | None) -> float | None:
 
 
 # --------------------------------------------------------------------------
-# Prozesse
+# braille drawing
+# --------------------------------------------------------------------------
+#
+# A braille cell is a 2x4 dot matrix, so one character holds two samples
+# horizontally and four steps vertically - the same trick btop uses for its
+# graphs. Dot bit values within U+2800:
+#
+#     left column, top to bottom : 0x01 0x02 0x04 0x40
+#     right column, top to bottom: 0x08 0x10 0x20 0x80
+
+BRAILLE_BASE = 0x2800
+DOT_BITS = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
+CELL_FULL = chr(BRAILLE_BASE | 0xFF)
+CELL_LEFT = chr(BRAILLE_BASE | 0x47)
+CELL_TRACK = chr(BRAILLE_BASE | 0xC0)   # bottom row only: an empty rail
+CELL_EMPTY = chr(BRAILLE_BASE)
+
+# Green through yellow to red, as xterm-256 indices. Terminals limited to
+# eight colours fall back to plain green/yellow/red (see Palette).
+GRADIENT = (46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196)
+GRAD_N = len(GRADIENT)
+
+
+def grad_style(fraction: float) -> str:
+    """Pick a gradient step for a 0..1 value."""
+    idx = int(max(0.0, min(1.0, fraction)) * (GRAD_N - 1) + 0.5)
+    return f"grad{idx}"
+
+
+Seg = tuple[str, str]  # (text, style name)
+
+
+class Graph:
+    """A scrolling braille graph that keeps more history than it draws.
+
+    The buffer is deliberately much wider than any terminal, so resizing the
+    window only changes how much of the past is visible - no samples are lost
+    and the graph reflows instantly.
+    """
+
+    def __init__(self) -> None:
+        self.samples: deque[float] = deque(maxlen=HISTORY)
+        self.seen = True
+
+    def push(self, value: float | None) -> None:
+        self.samples.append(float(value) if value is not None else 0.0)
+
+    def scale(self, floor: float = 1.0) -> float:
+        return max(floor, max(self.samples, default=0.0))
+
+    def render(self, width: int, height: int, maxval: float,
+               ascii_mode: bool) -> list[list[Seg]]:
+        """Draw the graph as `height` rows of `width` characters."""
+        width = max(1, width)
+        height = max(1, height)
+        maxval = max(1e-9, maxval)
+        need = width * 2
+        data = list(self.samples)[-need:]
+        data = [0.0] * (need - len(data)) + data
+
+        if ascii_mode:
+            ramp = " .:-=+*#%@"
+            rows = []
+            for row in range(height):
+                line = []
+                for col in range(width):
+                    value = max(data[2 * col], data[2 * col + 1]) / maxval
+                    band = (height - 1 - row) / height
+                    local = max(0.0, min(1.0, (value - band) * height))
+                    line.append((ramp[int(local * (len(ramp) - 1))],
+                                 grad_style(value)))
+                rows.append(line)
+            return rows
+
+        total_dots = height * 4
+        rows: list[list[Seg]] = []
+        for row in range(height):
+            line: list[Seg] = []
+            for col in range(width):
+                bits = 0
+                for side in (0, 1):
+                    value = data[2 * col + side] / maxval
+                    # At least one dot, so an idle graph still shows a
+                    # baseline instead of vanishing - same as btop does.
+                    filled = max(1, int(round(max(0.0, min(1.0, value)) * total_dots)))
+                    for k in range(4):
+                        if (row * 4 + k) >= total_dots - filled:
+                            bits |= DOT_BITS[side][k]
+                if height > 1:
+                    # Tall graphs get btop's vertical gradient: the higher a
+                    # dot sits, the hotter its colour.
+                    band = (total_dots - (row * 4 + 2)) / total_dots
+                    style = grad_style(band)
+                else:
+                    style = grad_style(max(data[2 * col], data[2 * col + 1]) / maxval)
+                line.append((chr(BRAILLE_BASE | bits) if bits else CELL_EMPTY,
+                             style if bits else "track"))
+            rows.append(line)
+        return rows
+
+
+def meter(pct: float | None, width: int, ascii_mode: bool) -> list[Seg]:
+    """A horizontal level bar with a left-to-right gradient, like btop's."""
+    width = max(1, width)
+    if ascii_mode:
+        filled = int(round(max(0.0, min(100.0, pct or 0.0)) / 100.0 * width))
+        return [("#" * filled, grad_style(0.5)), ("." * (width - filled), "track")]
+    if pct is None:
+        return [(CELL_TRACK * width, "track")]
+    dots = int(round(max(0.0, min(100.0, pct)) / 100.0 * width * 2))
+    out: list[Seg] = []
+    for col in range(width):
+        position = col / max(1, width - 1)
+        if dots >= (col + 1) * 2:
+            out.append((CELL_FULL, grad_style(position)))
+        elif dots == col * 2 + 1:
+            out.append((CELL_LEFT, grad_style(position)))
+        else:
+            out.append((CELL_TRACK, "track"))
+    return out
+
+
+# --------------------------------------------------------------------------
+# processes
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -164,7 +289,7 @@ def proc_read(pid: int) -> ProcInfo | None:
     raw = read_text(f"{base}/stat")
     if raw is None:
         return None
-    # comm kann Leerzeichen und Klammern enthalten, darum ab der letzten ")".
+    # comm may contain spaces and parentheses, so start after the last ")".
     try:
         rest = raw[raw.rindex(")") + 2:].split()
         comm = raw[raw.index("(") + 1:raw.rindex(")")]
@@ -196,11 +321,11 @@ def proc_all() -> list[ProcInfo]:
 
 def proc_scan(pattern: re.Pattern[str],
               procs: list[ProcInfo] | None = None) -> list[ProcInfo]:
-    """Prozesse nach Programmnamen suchen.
+    """Find processes by program name.
 
-    Bewusst nur comm und der Basename von argv[0] - nicht die ganze
-    Kommandozeile. earlyoom laeuft mit "--prefer ^(python3?|llama-server|
-    ollama)$" und wuerde sonst als Backend durchgehen.
+    Deliberately only comm and the basename of argv[0], never the full command
+    line: earlyoom runs with "--prefer ^(python3?|llama-server|ollama)$" and
+    would otherwise be counted as a backend.
     """
     found = []
     for info in (procs if procs is not None else proc_all()):
@@ -216,12 +341,12 @@ DRM_SIZE_RE = re.compile(r"^(\d+)\s*(KiB|MiB|GiB|B)?$")
 
 
 def drm_proc_stats(pid: int) -> dict | None:
-    """GPU-Speicher und GPU-Zeit eines Prozesses aus /proc/<pid>/fdinfo.
+    """Per-process GPU memory and GPU time from /proc/<pid>/fdinfo.
 
-    Auf Systemen mit gemeinsamem Speicher (Strix Halo und Verwandte) liegt das
-    Modell im GTT und taucht in RSS gar nicht auf - erst drm-resident-gtt zeigt
-    die wahre Belegung. Lesbar nur fuer eigene Prozesse; fremde Dienste wie ein
-    als root laufendes Ollama liefern nichts.
+    On unified-memory systems (Strix Halo and relatives) the model lives in
+    GTT and never shows up in RSS - only drm-resident-gtt reveals what is
+    really held. Readable for own processes only; a service running as its own
+    user, such as Ollama, yields nothing.
     """
     fd_dir = f"/proc/{pid}/fdinfo"
     try:
@@ -260,8 +385,8 @@ def drm_proc_stats(pid: int) -> dict | None:
                     pass
         entry = {"mem": size("drm-resident-gtt") + size("drm-resident-vram"),
                  "engine_ns": engine}
-        # Mehrere Deskriptoren koennen denselben DRM-Client meinen - sonst
-        # zaehlt der Speicher mehrfach.
+        # Several descriptors can refer to the same DRM client; without this
+        # the memory would be counted more than once.
         old = clients.get(client)
         if old is None or entry["mem"] > old["mem"]:
             clients[client] = entry
@@ -272,7 +397,7 @@ def drm_proc_stats(pid: int) -> dict | None:
 
 
 class GpuTimeTracker:
-    """GPU-Auslastung je Prozess aus der kumulierten Engine-Zeit."""
+    """Per-process GPU load from the cumulative engine time."""
 
     def __init__(self) -> None:
         self._prev: dict[int, tuple[float, int]] = {}
@@ -293,7 +418,7 @@ class GpuTimeTracker:
 
 
 class CpuTracker:
-    """CPU-Prozent je PID aus /proc-Deltas, ohne externe Tools."""
+    """Per-PID CPU percentage from /proc deltas, without external tools."""
 
     def __init__(self) -> None:
         self._prev: dict[int, tuple[float, int]] = {}
@@ -316,7 +441,7 @@ class CpuTracker:
 
 
 class RateTracker:
-    """tok/s aus monoton wachsenden Zaehlern."""
+    """tokens/s from monotonically growing counters."""
 
     def __init__(self) -> None:
         self._prev: dict[str, tuple[float, float]] = {}
@@ -331,13 +456,13 @@ class RateTracker:
             return None
         elapsed = now - prev[0]
         delta = total - prev[1]
-        if elapsed <= 0 or delta < 0:  # Zaehler zurueckgesetzt
+        if elapsed <= 0 or delta < 0:  # counter was reset
             return None
         return delta / elapsed
 
 
 # --------------------------------------------------------------------------
-# llama-server Kommandozeile auswerten
+# reading llama-server command lines
 # --------------------------------------------------------------------------
 
 LLAMA_FLAGS = {
@@ -352,7 +477,7 @@ LLAMA_FLAGS = {
 
 
 def parse_llama_argv(argv: list[str]) -> dict:
-    """Die fuer die Anzeige relevanten llama-server-Optionen herausziehen."""
+    """Pull the llama-server options that matter for the display."""
     out: dict = {}
     lookup = {flag: name for name, flags in LLAMA_FLAGS.items() for flag in flags}
     for i, tok in enumerate(argv):
@@ -385,7 +510,7 @@ def parse_llama_argv(argv: list[str]) -> dict:
 
 
 def model_label(path: str | None, alias: str | None = None) -> str:
-    """Sprechender Name: Alias, sonst Verzeichnis/Datei statt sha256-Blob."""
+    """A readable name: the alias, else directory/file rather than a blob."""
     if alias:
         return alias
     if not path:
@@ -394,7 +519,7 @@ def model_label(path: str | None, alias: str | None = None) -> str:
     if p.name.startswith("sha256-") or p.name.startswith("sha256:"):
         return f"blob {p.name[7:19]}"
     stem = p.stem
-    # "Modell-00001-of-00003" auf den Grundnamen kuerzen
+    # Shorten "Model-00001-of-00003" back to the base name.
     stem = re.sub(r"-\d{5}-of-\d{5}$", "", stem)
     parent = p.parent.name
     if parent and parent.lower() not in {"models", "gguf", ".", "/"} and len(stem) < 12:
@@ -407,7 +532,7 @@ def model_label(path: str | None, alias: str | None = None) -> str:
 # --------------------------------------------------------------------------
 
 class Systemd:
-    """Duenne Huelle um systemctl. Fehlt systemd, liefert alles leere Werte."""
+    """A thin shell around systemctl. Without systemd everything comes back empty."""
 
     def __init__(self) -> None:
         self.available = shutil.which("systemctl") is not None
@@ -446,19 +571,15 @@ class Systemd:
                 names.append(parts[0].lstrip("● ").strip())
         return [n for n in names if n]
 
-    def cat(self, unit: str, user: bool) -> str:
-        scope = ["--user"] if user else []
-        return self._run([*scope, "cat", unit, "--no-pager"])
-
 
 ARGV_RE = re.compile(r"argv\[\]=(.*?)\s+;")
 
 
 def execstart_argv(show_value: str) -> list[str]:
-    """argv der letzten ExecStart-Zeile aus `systemctl show --property=ExecStart`.
+    """argv of the last ExecStart from `systemctl show --property=ExecStart`.
 
-    Diese Form wird bevorzugt, weil systemd die Specifier (%h, %t, ...) dort
-    bereits expandiert hat - in `systemctl cat` stehen sie noch roh drin.
+    That form is preferred because systemd has already expanded the specifiers
+    (%h, %t, ...) there - `systemctl cat` still shows them raw.
     """
     matches = ARGV_RE.findall(show_value or "")
     if not matches:
@@ -467,7 +588,7 @@ def execstart_argv(show_value: str) -> list[str]:
 
 
 def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
-    """llama-server-Optionen finden, auch wenn ExecStart auf ein Skript zeigt."""
+    """Find llama-server options even when ExecStart points at a script."""
     if not argv:
         return {}
     cfg = parse_llama_argv(argv)
@@ -475,8 +596,8 @@ def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
         return cfg
     if depth > 1:
         return cfg
-    # ExecStart zeigt auf ein Wrapper-Skript: dessen Inhalt nach llama-server
-    # durchsuchen, ohne es auszufuehren.
+    # ExecStart points at a wrapper script: read it for llama-server options,
+    # without executing anything.
     script = Path(os.path.expanduser(argv[0]))
     if not script.is_file():
         return cfg
@@ -503,6 +624,7 @@ def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
                 break
             text = new
         return text
+
     for line in body.splitlines():
         if "llama-server" not in line:
             continue
@@ -510,9 +632,9 @@ def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
         cfg.update(parse_llama_argv(tokens))
     if (cfg.get("model") or cfg.get("port")) or "llama-server" not in body:
         return cfg
-    # Die Aufrufzeile trug nichts Brauchbares - typisch fuer Skripte, die die
-    # Optionen erst in einem Bash-Array sammeln und mit "${ARGS[@]}" uebergeben.
-    # Dann das ganze Skript als Argumentvorrat lesen.
+    # The invocation line carried nothing useful - typical for scripts that
+    # collect options in a bash array and pass them as "${ARGS[@]}". Then read
+    # the whole script as a pool of arguments.
     flat = expand(body).replace("(", " ").replace(")", " ")
     tokens = [t.strip('"').strip("'") for t in flat.split()]
     cfg.update(parse_llama_argv(tokens))
@@ -520,7 +642,7 @@ def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Datenmodell
+# data model
 # --------------------------------------------------------------------------
 
 RUNNING, SLEEPING, STOPPED, ABSENT = "running", "sleeping", "stopped", "absent"
@@ -551,6 +673,10 @@ class Backend:
     extras: list[str] = field(default_factory=list)
     children: list["Backend"] = field(default_factory=list)
 
+    @property
+    def key(self) -> str:
+        return f"{self.kind}:{self.name}"
+
 
 @dataclass
 class Snapshot:
@@ -562,7 +688,7 @@ class Snapshot:
 
 
 # --------------------------------------------------------------------------
-# Sammler
+# collectors
 # --------------------------------------------------------------------------
 
 class Collector:
@@ -580,47 +706,8 @@ class Collector:
 
     # -- llama.cpp ---------------------------------------------------------
 
-    def _llama_live(self, be: Backend, host: str, port: int, use_metrics: bool) -> None:
-        """Messwerte vom laufenden Backend holen. Nur interne Ports, nie Sockets."""
-        if port in self.guarded_ports:
-            be.extras.append("Messung uebersprungen (Socket-Port)")
-            return
-        base = f"http://{host}:{port}"
-        slots = http_json(f"{base}/slots")
-        if isinstance(slots, list):
-            be.slots_total = len(slots)
-            be.slots_busy = sum(1 for s in slots if s.get("is_processing"))
-            be.busy = be.slots_busy > 0
-            if be.ctx is None and slots:
-                be.ctx = slots[0].get("n_ctx")
-            decoded = 0
-            for s in slots:
-                nxt = s.get("next_token")
-                if isinstance(nxt, list):
-                    nxt = nxt[0] if nxt else {}
-                if isinstance(nxt, dict):
-                    decoded += int(nxt.get("n_decoded") or 0)
-            be.tps = self.rates.rate(f"llama:{host}:{port}", float(decoded))
-        elif isinstance(slots, dict) and slots.get("error"):
-            be.extras.append("/slots deaktiviert")
-        if use_metrics and be.tps is None:
-            # Nur als Rueckfall: llamacpp:tokens_predicted_total wird erst beim
-            # Auftragsende fortgeschrieben und steht waehrend der Generierung
-            # still - /slots zaehlt dagegen live mit.
-            text = http_text(f"{base}/metrics")
-            if text:
-                be.tps = self._prom_tokens_per_second(text, f"llama-m:{host}:{port}")
-        if be.ctx is None or be.model == "-":
-            props = http_json(f"{base}/props")
-            if isinstance(props, dict):
-                if be.model == "-":
-                    be.model = model_label(props.get("model_path"))
-                gen = props.get("default_generation_settings") or {}
-                be.ctx = be.ctx or gen.get("n_ctx")
-                be.slots_total = be.slots_total or (props.get("total_slots") or 0)
-
     def _attach_gpu(self, be: Backend) -> None:
-        """GPU-Speicher und GPU-Zeit nachtragen, soweit /proc es hergibt."""
+        """Add GPU memory and GPU time, as far as /proc allows."""
         if not be.pid:
             return
         stats = drm_proc_stats(be.pid)
@@ -641,20 +728,67 @@ class Collector:
                 break
         return self.rates.rate(key, total)
 
+    def _llama_live(self, be: Backend, host: str, port: int, use_metrics: bool) -> None:
+        """Measure a running backend. Internal ports only, never sockets."""
+        if port in self.guarded_ports:
+            be.extras.append("skipped measurement (socket port)")
+            return
+        base = f"http://{host}:{port}"
+        slots = http_json(f"{base}/slots")
+        if isinstance(slots, list):
+            be.slots_total = len(slots)
+            be.slots_busy = sum(1 for s in slots if s.get("is_processing"))
+            be.busy = be.slots_busy > 0
+            if be.ctx is None and slots:
+                be.ctx = slots[0].get("n_ctx")
+            decoded = 0
+            for s in slots:
+                nxt = s.get("next_token")
+                if isinstance(nxt, list):
+                    nxt = nxt[0] if nxt else {}
+                if isinstance(nxt, dict):
+                    decoded += int(nxt.get("n_decoded") or 0)
+            be.tps = self.rates.rate(f"llama:{host}:{port}", float(decoded))
+        elif isinstance(slots, dict) and slots.get("error"):
+            be.extras.append("/slots disabled")
+        if use_metrics and be.tps is None:
+            # Fallback only: llamacpp:tokens_predicted_total is written when a
+            # task finishes and stands still during generation - /slots counts
+            # along live.
+            text = http_text(f"{base}/metrics")
+            if text:
+                be.tps = self._prom_tokens_per_second(text, f"llama-m:{host}:{port}")
+        if be.ctx is None or be.model == "-":
+            props = http_json(f"{base}/props")
+            if isinstance(props, dict):
+                if be.model == "-":
+                    be.model = model_label(props.get("model_path"))
+                gen = props.get("default_generation_settings") or {}
+                be.ctx = be.ctx or gen.get("n_ctx")
+                be.slots_total = be.slots_total or (props.get("total_slots") or 0)
+
+    def _llama_extras(self, be: Backend, cfg: dict) -> None:
+        if cfg.get("draft"):
+            be.extras.append(f"draft {cfg['draft']}")
+        if cfg.get("flash_attn"):
+            be.extras.append("fa")
+        if cfg.get("ngl"):
+            be.extras.append(f"ngl {cfg['ngl']}")
+
     def collect_llama(self, owned_pids: set[int]) -> list[Backend]:
         backends: list[Backend] = []
         claimed_pids: set[int] = set()
-
         handled: set[str] = set()
+
         for user_scope in (True, False):
             for sock in self.sd.units(self.cfg["llama"]["unit_glob_socket"], user_scope):
                 info = self.sd.show(sock, ["Listen", "Triggers", "ActiveState"], user_scope)
                 listen = info.get("Listen", "")
                 for m in re.finditer(r"(?::|\b)(\d{2,5})\s*\(Stream\)", listen):
                     self.guarded_ports.add(int(m.group(1)))
-                # Der gleichnamige Dienst zuerst: haengt vor dem Backend ein
-                # Proxy (systemd-socket-proxyd), steht der zwar in Triggers,
-                # kennt aber weder Modell noch Kontext.
+                # The like-named service first: if a proxy (systemd-socket-proxyd)
+                # sits in front of the backend it is what Triggers names, but it
+                # knows neither model nor context.
                 candidates = [sock.replace(".socket", ".service"),
                               *(info.get("Triggers") or "").split()]
                 handled.update(candidates)
@@ -679,15 +813,15 @@ class Collector:
                     continue
                 handled.add(svc)
                 be = self._llama_from_unit(svc, user_scope, None, "")
-                # Ohne erkennbares Modell und ohne laufenden Prozess ist es
-                # kein llama-Backend, sondern Beiwerk wie ein Socket-Proxy.
+                # With no recognisable model and no running process this is not
+                # a llama backend but scaffolding, such as a socket proxy.
                 if be is None or (be.model == "-" and not be.pid):
                     continue
                 backends.append(be)
                 if be.pid:
                     claimed_pids.add(be.pid)
 
-        # freistehende llama-server, die zu keiner Unit gehoeren
+        # free-standing llama-server processes belonging to no unit
         for proc in proc_scan(re.compile(r"^llama-server$")):
             if proc.pid in claimed_pids or proc.pid in owned_pids:
                 continue
@@ -695,7 +829,7 @@ class Collector:
                 continue
             cfg = parse_llama_argv(proc.argv)
             be = Backend(kind="llama", name=cfg.get("alias") or f"llama-server:{proc.pid}",
-                         state=RUNNING, detail="freistehend", pid=proc.pid,
+                         state=RUNNING, detail="standalone", pid=proc.pid,
                          port=cfg.get("port"), ctx=cfg.get("ctx"),
                          model=model_label(cfg.get("model"), cfg.get("alias")),
                          mem=proc.rss, mem_kind="RSS")
@@ -707,14 +841,6 @@ class Collector:
                                  bool(cfg.get("metrics")))
             backends.append(be)
         return backends
-
-    def _llama_extras(self, be: Backend, cfg: dict) -> None:
-        if cfg.get("draft"):
-            be.extras.append(f"draft {cfg['draft']}")
-        if cfg.get("flash_attn"):
-            be.extras.append("fa")
-        if cfg.get("ngl"):
-            be.extras.append(f"ngl {cfg['ngl']}")
 
     def _llama_from_unit(self, service: str, user_scope: bool,
                          socket_unit: str | None, listen: str) -> Backend | None:
@@ -734,7 +860,7 @@ class Collector:
         self._llama_extras(be, cfg)
         path = cfg.get("model")
         if path and not path.startswith("$") and not os.path.exists(path):
-            be.extras.append("Modelldatei fehlt")
+            be.extras.append("model file missing")
 
         sock_port = None
         m = re.search(r"(\d{2,5})\s*\(Stream\)", listen or "")
@@ -751,7 +877,7 @@ class Collector:
             be.port = sock_port or cfg.get("port")
             if pid:
                 info = proc_read(pid)
-                if info is None:  # MainPID zeigt auf den Wrapper, Kind suchen
+                if info is None:  # MainPID is the wrapper, look for the child
                     info = next((p for p in proc_scan(re.compile(r"^llama-server$"))
                                  if p.ppid == pid), None)
                 if info:
@@ -767,7 +893,7 @@ class Collector:
         elif socket_unit:
             be.state = SLEEPING
             be.port = sock_port
-            be.detail = f"Socket {sock_port}" if sock_port else "Socket aktiv"
+            be.detail = f"socket {sock_port}" if sock_port else "socket armed"
             left = props.get("InactiveEnterTimestampMonotonic")
             if left and left.isdigit() and int(left) > 0:
                 be.since = now_mono - int(left) / 1e6
@@ -779,8 +905,8 @@ class Collector:
     # -- Ollama ------------------------------------------------------------
 
     def _ollama_blob_map(self) -> dict[str, str]:
-        """sha256-Blob des Modell-Layers -> Modellname:Tag, aus den Manifesten."""
-        roots = [Path(p) for p in self.cfg["ollama"]["model_dirs"] if Path(p).is_dir()]
+        """Model-layer blob sha256 -> model name:tag, taken from the manifests."""
+        roots = [Path(os.path.expanduser(p)) for p in self.cfg["ollama"]["model_dirs"]]
         mapping: dict[str, str] = {}
         for root in roots:
             manifests = root / "manifests"
@@ -803,17 +929,16 @@ class Collector:
 
     @staticmethod
     def _manifest_name(parts: tuple[str, ...]) -> str:
-        """Manifestpfad -> Name wie in /api/ps.
+        """Manifest path -> the name as /api/ps reports it.
 
         registry.ollama.ai/library/gemma4/12b          -> gemma4:12b
         registry.ollama.ai/ns/nexus-medical/latest     -> ns/nexus-medical:latest
-        hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF/Q4_K_M
-            -> hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M
+        hf.co/user/Some-Model-GGUF/Q4_K_M              -> hf.co/user/Some-Model-GGUF:Q4_K_M
         """
         if len(parts) < 2:
             return ":".join(parts)
         path, tag = list(parts[:-1]), parts[-1]
-        # Die Standardregistry taucht im Namen nie auf, "library" auch nicht.
+        # The default registry never appears in the name, nor does "library".
         if path and path[0] in ("registry.ollama.ai", "ollama.com"):
             path = path[1:]
             if path[:1] == ["library"]:
@@ -846,7 +971,6 @@ class Collector:
             pids.add(server.pid)
         elif be.state == ABSENT:
             return be, pids
-
         if be.state != RUNNING:
             return be, pids
 
@@ -857,19 +981,19 @@ class Collector:
         if isinstance(ver, dict) and ver.get("version"):
             be.extras.append(f"v{ver['version']}")
 
-        # Jedes Kind von "ollama serve" ist ein Runner - egal ob es als
-        # llama-server oder als "ollama runner" auftritt.
+        # Every child of "ollama serve" is a runner, whether it shows up as
+        # llama-server or as "ollama runner".
         runners = [p for p in procs if p.ppid in pids and server and p.pid != server.pid]
         for r in runners:
             pids.add(r.pid)
 
         ps = http_json(f"{host}/api/ps")
         if not isinstance(ps, dict):
-            be.detail = "API nicht erreichbar"
+            be.detail = "API unreachable"
             return be, pids
         models = ps.get("models") or []
         if not models:
-            be.detail = "kein Modell geladen"
+            be.detail = "no model loaded"
             be.model = "-"
             return be, pids
 
@@ -883,7 +1007,7 @@ class Collector:
             vram = entry.get("size_vram") or 0
             total = entry.get("size") or 0
             child.mem = total or None
-            child.mem_kind = "GPU" if vram >= total > 0 else ("GPU-Anteil" if vram else "RAM")
+            child.mem_kind = "GPU" if vram >= total > 0 else ("part GPU" if vram else "RAM")
             if 0 < vram < total:
                 child.extras.append(f"{vram/total*100:.0f}% GPU")
             details = entry.get("details") or {}
@@ -916,7 +1040,7 @@ class Collector:
             be.extras.extend(first.extras)
             be.children = []
         else:
-            be.model = f"{len(be.children)} Modelle"
+            be.model = f"{len(be.children)} models"
             be.busy = any(c.busy for c in be.children)
             be.mem = sum(c.mem or 0 for c in be.children) or None
             be.mem_kind = "GPU"
@@ -976,7 +1100,7 @@ class Collector:
 
         health = http_json(f"{url}/api/v1/health")
         if not isinstance(health, dict):
-            be.detail = "API nicht erreichbar"
+            be.detail = "API unreachable"
             return be, pids
         if health.get("version"):
             be.extras.append(f"v{health['version']}")
@@ -986,7 +1110,7 @@ class Collector:
         loaded = health.get("all_models_loaded") or []
         if not loaded:
             be.model = "-"
-            be.detail = "kein Modell geladen"
+            be.detail = "no model loaded"
             return be, pids
 
         stats = http_json(f"{url}/api/v1/stats")
@@ -1007,8 +1131,10 @@ class Collector:
                 child.extras.append("pinned")
             if not entry.get("backend_alive", True):
                 child.state = STOPPED
-                child.detail = "Backend tot"
+                child.detail = "backend down"
             last_use = entry.get("last_use")
+            # last_use is monotonic milliseconds, so it only means something
+            # measured against /proc/uptime.
             if uptime_s and isinstance(last_use, (int, float)) and last_use > 0:
                 idle = uptime_s - last_use / 1000.0
                 if -60 < idle < uptime_s + 60:
@@ -1047,15 +1173,16 @@ class Collector:
             first = be.children[0]
             be.model, be.ctx, be.tps = first.model, first.ctx, first.tps
             be.gpu_mem, be.gpu_util = first.gpu_mem, first.gpu_util
+            be.last_use = first.last_use
             be.extras.extend(first.extras)
             be.detail = first.detail
             be.children = []
         else:
-            be.model = f"{len(be.children)} Modelle"
+            be.model = f"{len(be.children)} models"
             if active:
-                be.detail = f"vorn: {active}"
+                be.detail = f"front: {active}"
         if stats and isinstance(stats.get("output_tokens_total"), int):
-            be.extras.append(f"{human_count(stats['output_tokens_total'])} tok gesamt")
+            be.extras.append(f"{human_count(stats['output_tokens_total'])} tok total")
         return be, pids
 
     # -- GPU ---------------------------------------------------------------
@@ -1096,6 +1223,7 @@ class Collector:
                 return {}
             if out:
                 f = [x.strip() for x in out.splitlines()[0].split(",")]
+
                 def num(idx, scale=1.0):
                     try:
                         return float(f[idx]) * scale
@@ -1108,7 +1236,7 @@ class Collector:
     # -- NPU ---------------------------------------------------------------
 
     def _npu_product(self) -> str | None:
-        """Geraetename einmalig ueber xrt-smi holen; der Aufruf ist traege."""
+        """Fetch the device name via xrt-smi once; the call is slow."""
         if self._npu_probed:
             return self._npu_name
         self._npu_probed = True
@@ -1125,9 +1253,6 @@ class Collector:
         m = re.search(r"Processor\s*:\s*(.+)", out)
         if m:
             self._npu_name = m.group(1).strip()
-        m = re.search(r"NPU Firmware Version\s*:\s*(\S+)", out)
-        if m:
-            self._npu_name = f"{self._npu_name or 'NPU'}"
         return self._npu_name
 
     def collect_npu(self) -> dict:
@@ -1145,8 +1270,8 @@ class Collector:
         if driver.is_symlink():
             npu["driver"] = os.path.basename(os.readlink(driver))
         npu["name"] = self._npu_product()
-        # Auslastung liefert amdxdna nur ueber debugfs (root). Ersatzweise:
-        # wer haelt das Geraet offen?
+        # amdxdna only exposes utilisation through debugfs, which needs root.
+        # Without it, fall back to: who has the device open?
         busy = read_int(dev / "npu_busy_percent")
         if busy is not None:
             npu["busy"] = busy
@@ -1155,7 +1280,7 @@ class Collector:
 
     @staticmethod
     def _accel_users() -> list[tuple[int, str]]:
-        """Prozesse mit offenem /dev/accel/*. Ohne root nur die eigenen."""
+        """Processes holding /dev/accel/* open. Without root, only our own."""
         users: list[tuple[int, str]] = []
         for entry in os.listdir("/proc"):
             if not entry.isdigit():
@@ -1175,7 +1300,7 @@ class Collector:
                     break
         return users
 
-    # -- System ------------------------------------------------------------
+    # -- system ------------------------------------------------------------
 
     def collect_system(self) -> dict:
         info: dict = {}
@@ -1211,10 +1336,10 @@ class Collector:
             self._prev_cpu_total = (total, idle)
         return info
 
-    # -- alles zusammen ----------------------------------------------------
+    # -- everything together ------------------------------------------------
 
     def _prime_guards(self) -> None:
-        """Socket-Ports sperren, bevor irgendein Sammler HTTP spricht."""
+        """Block socket ports before any collector speaks HTTP."""
         for user_scope in (True, False):
             for sock in self.sd.units(self.cfg["llama"]["unit_glob_socket"], user_scope):
                 listen = self.sd.show(sock, ["Listen"], user_scope).get("Listen", "")
@@ -1246,11 +1371,11 @@ class Collector:
 
 
 # --------------------------------------------------------------------------
-# Konfiguration
+# configuration
 # --------------------------------------------------------------------------
 
 DEFAULT_CFG: dict = {
-    "ui": {"interval": 2.0, "ascii": False},
+    "ui": {"interval": 2.0, "ascii": False, "graph_height": "auto"},
     "llama": {
         "unit_glob_socket": "llama-*.socket",
         "unit_glob_service": "llama-*.service",
@@ -1260,16 +1385,17 @@ DEFAULT_CFG: dict = {
         "model_dirs": [
             "/var/lib/ollama/.ollama/models",
             "/usr/share/ollama/.ollama/models",
-            os.path.expanduser("~/.ollama/models"),
+            "~/.ollama/models",
         ],
     },
     "lemonade": {"url": "http://127.0.0.1:8000", "unit": "lemond.service"},
-    "npu": {"xrt_smi": ["/opt/xilinx/xrt/bin/xrt-smi", "/opt/xilinx/xrt/bin/unwrapped/xrt-smi"]},
+    "npu": {"xrt_smi": ["/opt/xilinx/xrt/bin/xrt-smi",
+                        "/opt/xilinx/xrt/bin/unwrapped/xrt-smi"]},
 }
 
 
 def load_config(path: str | None) -> dict:
-    cfg = json.loads(json.dumps(DEFAULT_CFG))  # tiefe Kopie
+    cfg = json.loads(json.dumps(DEFAULT_CFG))  # deep copy
     candidates = [path] if path else [
         os.environ.get("LLMTOP_CONFIG"),
         os.path.join(os.environ.get("XDG_CONFIG_HOME",
@@ -1282,7 +1408,7 @@ def load_config(path: str | None) -> dict:
             with open(cand, "rb") as fh:
                 user = tomllib.load(fh)
         except (OSError, ValueError) as exc:
-            print(f"llmtop: Konfiguration {cand} unlesbar: {exc}", file=sys.stderr)
+            print(f"llmtop: cannot read config {cand}: {exc}", file=sys.stderr)
             continue
         for section, values in user.items():
             if isinstance(values, dict):
@@ -1306,169 +1432,282 @@ def load_config(path: str | None) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Darstellung
+# rendering
 # --------------------------------------------------------------------------
 
-Seg = tuple[str, str]  # (Text, Stilname)
-
 STATE_STYLE = {RUNNING: "ok", SLEEPING: "idle", STOPPED: "warn", ABSENT: "dim"}
-STATE_WORD = {RUNNING: "laeuft", SLEEPING: "schlaeft", STOPPED: "gestoppt", ABSENT: "fehlt"}
+STATE_WORD = {RUNNING: "running", SLEEPING: "asleep", STOPPED: "stopped",
+              ABSENT: "absent"}
 KIND_TITLE = {"llama": "llama.cpp", "ollama": "Ollama", "lemonade": "Lemonade"}
 
 
-def bar(pct: float | None, width: int, ascii_mode: bool) -> str:
-    if pct is None:
-        return " " * width
-    filled = int(round(max(0.0, min(100.0, pct)) / 100.0 * width))
-    if ascii_mode:
-        return "#" * filled + "." * (width - filled)
-    return "█" * filled + "░" * (width - filled)
+class Line:
+    """A single output line that knows how much room is left."""
+
+    def __init__(self, width: int) -> None:
+        self.width = max(1, width)
+        self.segs: list[Seg] = []
+        self.used = 0
+
+    @property
+    def left(self) -> int:
+        return self.width - self.used
+
+    def add(self, text: str, style: str = "") -> bool:
+        """Append if it still fits; otherwise drop it and report so."""
+        if not text or len(text) > self.left:
+            return False
+        self.segs.append((text, style))
+        self.used += len(text)
+        return True
+
+    def add_segs(self, segs: list[Seg]) -> bool:
+        total = sum(len(t) for t, _ in segs)
+        if total > self.left:
+            return False
+        self.segs.extend(segs)
+        self.used += total
+        return True
+
+    def add_clipped(self, text: str, style: str = "", minimum: int = 4) -> bool:
+        """Append, shortening with an ellipsis when space is tight."""
+        if self.left < minimum:
+            return False
+        if len(text) <= self.left:
+            return self.add(text, style)
+        return self.add(text[: self.left - 1] + "…", style)
 
 
-def busy_style(pct: float | None) -> str:
-    if pct is None:
-        return "dim"
-    if pct >= 85:
-        return "bad"
-    if pct >= 50:
-        return "warn"
-    return "ok"
+class Layout:
+    """Sizes derived from the current terminal, recomputed on every frame."""
+
+    def __init__(self, width: int, height: int, graph_height: str | int) -> None:
+        self.width = max(20, width)
+        self.height = max(6, height)
+        self.wide = self.width >= 96
+        self.mid = 72 <= self.width < 96
+        self.narrow = self.width < 72
+        self.graph_w = max(8, min(40, (self.width - 52) // 2))
+        self.meter_w = max(6, min(14, (self.width - 52) // 4))
+        self.split_header = self.width < 64
+        self.name_w = 18 if self.wide else (14 if self.mid else 11)
+        self.spark_w = 0 if self.width < 84 else (14 if self.wide else 8)
+        if graph_height == "auto":
+            self.graph_h = 2 if self.height >= 26 else 1
+        else:
+            try:
+                self.graph_h = max(1, min(4, int(graph_height)))
+            except (TypeError, ValueError):
+                self.graph_h = 1
 
 
 class Renderer:
-    def __init__(self, ascii_mode: bool) -> None:
+    def __init__(self, ascii_mode: bool, graph_height: str | int = "auto") -> None:
         self.ascii = ascii_mode
+        self.graph_height = graph_height
         self.dot_on = "*" if ascii_mode else "●"
         self.dot_off = "o" if ascii_mode else "○"
         self.sep = "-" if ascii_mode else "─"
         self.mid = "|" if ascii_mode else "·"
+        self.graphs: dict[str, Graph] = {}
+        self._last_fed = -1.0
 
-    def rows(self, snap: Snapshot, width: int, interval: float) -> list[list[Seg]]:
-        out: list[list[Seg]] = []
-        out.extend(self._header(snap, width))
-        out.append([])
-        by_kind: dict[str, list[Backend]] = {}
+    # -- history ----------------------------------------------------------
+
+    def graph(self, key: str) -> Graph:
+        g = self.graphs.get(key)
+        if g is None:
+            g = self.graphs[key] = Graph()
+        g.seen = True
+        return g
+
+    def feed(self, snap: Snapshot) -> None:
+        """Take one sample per snapshot - never per drawn frame."""
+        if snap.taken == self._last_fed:
+            return
+        self._last_fed = snap.taken
+        for g in self.graphs.values():
+            g.seen = False
+        self.graph("cpu").push(snap.system.get("cpu"))
+        self.graph("gpu").push(snap.gpu.get("busy"))
         for be in snap.backends:
-            by_kind.setdefault(be.kind, []).append(be)
-        for kind in ("llama", "ollama", "lemonade"):
-            group = by_kind.get(kind) or []
-            if not group:
-                continue
-            out.append(self._rule(KIND_TITLE[kind], width))
-            for be in group:
-                out.extend(self._backend(be, width, indent=0))
-                for child in be.children:
-                    out.extend(self._backend(child, width, indent=2))
-            out.append([])
-        if not any(by_kind.values()):
-            out.append([("  Kein Backend gefunden.", "dim")])
-        out.append([(f"  Aktualisierung alle {interval:g}s", "dim"),
-                    ("  |  q beenden  +/- Intervall  r sofort", "dim")])
+            for node in (be, *be.children):
+                if node.tps is not None:
+                    self.graph(f"tps:{node.key}").push(node.tps)
+        # Drop graphs of backends that are gone, so they cannot pile up.
+        for key in [k for k, g in self.graphs.items()
+                    if not g.seen and k.startswith("tps:")]:
+            del self.graphs[key]
+
+    # -- building blocks ---------------------------------------------------
+
+    def _meter_segs(self, pct: float | None, width: int) -> list[Seg]:
+        return meter(pct, width, self.ascii)
+
+    def _pct_seg(self, value: float | None) -> Seg:
+        if value is None:
+            return ("    -", "dim")
+        return (f"{value:4.0f}%", grad_style(value / 100.0))
+
+    def _metric_block(self, key: str, label: str, value: float | None,
+                      lay: Layout, right: list[Seg], live: bool) -> list[list[Seg]]:
+        """One labelled metric: a history graph when live, a meter otherwise."""
+        pad = " " * (len(label) + 1)
+        if not live:
+            line = Line(lay.width)
+            line.add(f"{label} ", "label")
+            line.add_segs(self._meter_segs(value, lay.graph_w))
+            line.add(" ")
+            line.add(*self._pct_seg(value))
+            line.add_segs(right)
+            return [line.segs]
+        rows = self.graph(key).render(lay.graph_w, lay.graph_h, 100.0, self.ascii)
+        out: list[list[Seg]] = []
+        for i, grow in enumerate(rows):
+            line = Line(lay.width)
+            line.add(f"{label} " if i == 0 else pad, "label")
+            line.add_segs(grow)
+            if i == 0:
+                line.add(" ")
+                line.add(*self._pct_seg(value))
+                line.add_segs(right)
+            out.append(line.segs)
         return out
+
+    def _side_meter(self, label: str, pct: float | None, text: str,
+                    lay: Layout) -> list[Seg]:
+        segs: list[Seg] = [(f"   {label} ", "label")]
+        segs.extend(self._meter_segs(pct, lay.meter_w))
+        segs.append((f" {text}", ""))
+        return segs
+
+    def _own_line(self, segs: list[Seg], lay: Layout) -> list[Seg]:
+        """Put side info on its own row, without the inline indent."""
+        if not segs:
+            return []
+        first, style = segs[0]
+        line = Line(lay.width)
+        line.add_segs([(first.lstrip(), style), *segs[1:]])
+        return line.segs
 
     def _rule(self, title: str, width: int) -> list[Seg]:
         pad = max(0, width - len(title) - 5)
         return [(f"{self.sep}{self.sep} ", "dim"), (title, "title"),
                 (" " + self.sep * pad, "dim")]
 
-    def _header(self, snap: Snapshot, width: int) -> list[list[Seg]]:
-        sysinfo = snap.system
-        rows: list[list[Seg]] = []
-        host = os.uname().nodename
-        head = [("llmtop", "title"), (f" {VERSION}", "dim"), ("  ", ""), (host, "hi")]
-        if sysinfo.get("uptime"):
-            head.append((f"  up {human_delta(sysinfo['uptime'])}", "dim"))
-        if sysinfo.get("load"):
-            head.append(("  load " + " ".join(sysinfo["load"]), "dim"))
-        rows.append(head)
+    # -- header ------------------------------------------------------------
 
-        bw = 12 if width < 100 else 18
-        cpu = sysinfo.get("cpu")
-        line: list[Seg] = [("CPU ", "label"),
-                           (bar(cpu, bw, self.ascii), busy_style(cpu)),
-                           (f" {cpu:4.0f}%" if cpu is not None else "    -", "")]
+    def _header(self, snap: Snapshot, lay: Layout, live: bool) -> list[list[Seg]]:
+        sysinfo, gpu, npu = snap.system, snap.gpu, snap.npu
+        rows: list[list[Seg]] = []
+
+        title = Line(lay.width)
+        title.add("llmtop", "title")
+        if not lay.narrow:
+            title.add(f" {VERSION}", "dim")
+        title.add("  ")
+        title.add(os.uname().nodename, "hi")
+        if sysinfo.get("uptime"):
+            title.add(f"  up {human_delta(sysinfo['uptime'])}", "dim")
+        if sysinfo.get("load") and not lay.narrow:
+            title.add("  load " + " ".join(sysinfo["load"]), "dim")
+        rows.append(title.segs)
+
+        ram_segs: list[Seg] = []
         if sysinfo.get("mem_total"):
             used, total = sysinfo.get("mem_used"), sysinfo["mem_total"]
             pct = used / total * 100 if used else None
-            line += [("   RAM ", "label"),
-                     (f"{human_bytes(used)}/{human_bytes(total)}", ""),
-                     (f" ({pct:.0f}%)" if pct else "", "dim")]
-        rows.append(line)
+            ram_segs = self._side_meter(
+                "RAM", pct, f"{human_bytes(used)}/{human_bytes(total)}", lay)
+        rows.extend(self._metric_block("cpu", "CPU", sysinfo.get("cpu"), lay,
+                                       [] if lay.split_header else ram_segs, live))
+        if lay.split_header and ram_segs:
+            rows.append(self._own_line(ram_segs, lay))
 
-        gpu = snap.gpu
         if gpu:
-            busy = gpu.get("busy")
-            line = [("GPU ", "label"), (bar(busy, bw, self.ascii), busy_style(busy)),
-                    (f" {busy:4.0f}%" if busy is not None else "    -", "")]
+            side: list[Seg] = []
             if gpu.get("gtt_total"):
-                line += [("   GTT ", "label"),
-                         (f"{human_bytes(gpu.get('gtt_used'))}/{human_bytes(gpu['gtt_total'])}", "")]
-            if gpu.get("vram_total") and (gpu.get("vram_total") or 0) > (2 << 30):
-                line += [("  VRAM ", "label"),
-                         (f"{human_bytes(gpu.get('vram_used'))}/{human_bytes(gpu['vram_total'])}", "")]
+                used = gpu.get("gtt_used") or 0
+                side = self._side_meter(
+                    "GTT", used / gpu["gtt_total"] * 100,
+                    f"{human_bytes(used)}/{human_bytes(gpu['gtt_total'])}", lay)
+            elif gpu.get("vram_total"):
+                used = gpu.get("vram_used") or 0
+                side = self._side_meter(
+                    "VRAM", used / gpu["vram_total"] * 100,
+                    f"{human_bytes(used)}/{human_bytes(gpu['vram_total'])}", lay)
             if gpu.get("temp"):
-                line.append((f"  {gpu['temp']:.0f}°C", "dim"))
+                side.append((f"  {gpu['temp']:.0f}°C", "dim"))
             if gpu.get("watt"):
-                line.append((f" {gpu['watt']:.0f}W", "dim"))
-            if gpu.get("name") and width > 110:
-                line.append((f"  {gpu['name']}", "dim"))
-            rows.append(line)
+                side.append((f" {gpu['watt']:.0f}W", "dim"))
+            if lay.wide and gpu.get("name") and gpu["name"] != "AMD GPU":
+                side.append((f"  {gpu['name']}", "dim"))
+            rows.extend(self._metric_block("gpu", "GPU", gpu.get("busy"), lay,
+                                           [] if lay.split_header else side, live))
+            if lay.split_header and side:
+                rows.append(self._own_line(side, lay))
 
-        npu = snap.npu
         if npu:
+            line = Line(lay.width)
+            line.add("NPU ", "label")
             users = npu.get("users") or []
             if npu.get("busy") is not None:
-                state_seg = (bar(npu["busy"], bw, self.ascii), busy_style(npu["busy"]))
-                tail = [(f" {npu['busy']:4.0f}%", "")]
+                line.add_segs(self._meter_segs(npu["busy"], lay.meter_w))
+                line.add(" ")
+                line.add(*self._pct_seg(npu["busy"]))
             elif users:
-                state_seg = (f"belegt: {', '.join(c for _, c in users[:3])}", "ok")
-                tail = []
+                line.add_clipped("in use by " + ", ".join(c for _, c in users[:3]), "ok")
             else:
-                state_seg = ("frei", "idle")
-                tail = [("  (Auslastung nur via debugfs/root)", "dim")]
-            line = [("NPU ", "label"), state_seg, *tail]
+                line.add("idle", "idle")
             meta = []
             if npu.get("driver"):
                 meta.append(npu["driver"])
             if npu.get("fw"):
-                meta.append(f"FW {npu['fw']}")
+                meta.append(f"fw {npu['fw']}")
             if npu.get("power_state"):
                 meta.append(npu["power_state"])
+            if lay.wide and npu.get("name"):
+                meta.append(npu["name"])
             if meta:
-                line.append(("   " + f" {self.mid} ".join(meta), "dim"))
-            rows.append(line)
+                line.add_clipped("   " + f" {self.mid} ".join(meta), "dim")
+            rows.append(line.segs)
         return rows
 
-    def _backend(self, be: Backend, width: int, indent: int) -> list[list[Seg]]:
+    # -- backends ----------------------------------------------------------
+
+    def _backend(self, be: Backend, lay: Layout, indent: int,
+                 live: bool) -> list[list[Seg]]:
         pad = " " * (2 + indent)
+        name_w = max(8, lay.name_w - indent)
         dot = self.dot_on if be.state == RUNNING else self.dot_off
         style = STATE_STYLE.get(be.state, "dim")
-        name_w = 18 if indent == 0 else 16
-        head: list[Seg] = [
-            (pad, ""), (dot + " ", style),
-            (be.name[:name_w].ljust(name_w) + " ", "hi" if be.state == RUNNING else ""),
-            (STATE_WORD.get(be.state, be.state).ljust(9), style),
-        ]
-        if be.busy:
-            head.append(("aktiv ", "bad"))
-        if be.detail and not (be.busy and be.detail.lower() in
-                              ("busy", "aktiv", "processing", "streaming")):
-            head.append((be.detail + "  ", "dim"))
-        if be.port:
-            head.append((f":{be.port} ", "dim"))
-        if be.pid:
-            head.append((f"pid {be.pid} ", "dim"))
-        if be.since is not None and be.state in (RUNNING, SLEEPING):
-            word = "seit" if be.state == RUNNING else "ruht"
-            head.append((f"{word} {human_delta(be.since)}", "dim"))
-        rows = [head]
 
-        if be.state in (ABSENT,):
+        head = Line(lay.width)
+        head.add(pad)
+        head.add(dot + " ", style)
+        head.add(be.name[:name_w].ljust(name_w) + " ",
+                 "hi" if be.state == RUNNING else "")
+        head.add(STATE_WORD.get(be.state, be.state).ljust(8) + " ", style)
+        if be.busy:
+            head.add("busy ", "bad")
+        if be.detail and not (be.busy and be.detail.lower() in
+                              ("busy", "processing", "streaming")):
+            head.add_clipped(be.detail + "  ", "dim", minimum=8)
+        if be.port:
+            head.add(f":{be.port} ", "dim")
+        if be.pid and not lay.narrow:
+            head.add(f"pid {be.pid} ", "dim")
+        if be.since is not None and be.state in (RUNNING, SLEEPING):
+            head.add(("up " if be.state == RUNNING else "idle ")
+                     + human_delta(be.since), "dim")
+        rows = [head.segs]
+        if be.state == ABSENT:
             return rows
 
         info = " " * (4 + indent)
-        second: list[Seg] = [(info, "")]
-        second.append((be.model, "model"))
+        second = Line(lay.width)
+        second.add(info)
+        second.add_clipped(be.model, "model", minimum=8)
         bits: list[Seg] = []
         if be.ctx:
             bits.append((f"ctx {human_ctx(be.ctx)}", ""))
@@ -1480,51 +1719,92 @@ class Renderer:
             bits.append((f"{human_bytes(be.mem)} {be.mem_kind}".strip(), ""))
         for extra in be.extras:
             bits.append((extra, "dim"))
-        for seg in bits:
-            second.append((f" {self.mid} ", "dim"))
-            second.append(seg)
-        rows.append(second)
+        for text, sty in bits:
+            if not second.add_segs([(f" {self.mid} ", "dim"), (text, sty)]):
+                break
+        rows.append(second.segs)
 
-        third: list[Seg] = [(info, "")]
-        has = False
+        third = Line(lay.width)
+        third.add(info)
+        before = third.used
         if be.cpu is not None:
-            third += [("CPU ", "label"), (f"{be.cpu:5.1f}%", busy_style(be.cpu))]
-            has = True
+            third.add("cpu ", "label")
+            third.add(f"{be.cpu:5.1f}%", grad_style(be.cpu / 100.0))
         if be.gpu_util is not None:
-            third += [("   GPU ", "label"),
-                      (f"{be.gpu_util:5.1f}%", busy_style(be.gpu_util))]
-            has = True
+            third.add("   gpu ", "label")
+            third.add(f"{be.gpu_util:5.1f}%", grad_style(be.gpu_util / 100.0))
         if be.slots_total:
-            third += [("   Slots ", "label"),
-                      (f"{be.slots_busy}/{be.slots_total}",
-                       "bad" if be.slots_busy else "")]
-            has = True
+            third.add("   slots ", "label")
+            third.add(f"{be.slots_busy}/{be.slots_total}",
+                      "bad" if be.slots_busy else "")
         if be.tps is not None:
-            third += [("   ", ""), (f"{be.tps:.1f} tok/s",
-                                    "bad" if be.tps > 0.05 else "dim")]
-            has = True
+            third.add("   ")
+            third.add(f"{be.tps:.1f} tok/s", "bad" if be.tps > 0.05 else "dim")
+            if live and lay.spark_w and third.left > lay.spark_w + 12:
+                g = self.graph(f"tps:{be.key}")
+                spark = g.render(lay.spark_w, 1, g.scale(10.0), self.ascii)
+                third.add(" ")
+                third.add_segs(spark[0])
         if be.last_use is not None and not be.busy:
-            third += [("   ", ""), (f"zuletzt vor {human_delta(be.last_use)}", "dim")]
-            has = True
+            third.add(f"   last used {human_delta(be.last_use)} ago", "dim")
         if be.idle_in is not None:
-            word = "entlaedt in" if be.idle_in > 0 else "entladen seit"
-            third += [("   ", ""), (f"{word} {human_delta(abs(be.idle_in))}",
-                                    "warn" if 0 < be.idle_in < 120 else "dim")]
-            has = True
-        if has:
-            rows.append(third)
+            word = "unloads in" if be.idle_in > 0 else "unloaded"
+            third.add(f"   {word} {human_delta(abs(be.idle_in))}",
+                      "warn" if 0 < be.idle_in < 120 else "dim")
+        if third.used > before:
+            rows.append(third.segs)
         return rows
 
+    # -- everything --------------------------------------------------------
+
+    def rows(self, snap: Snapshot, width: int, height: int, interval: float,
+             live: bool) -> list[list[Seg]]:
+        lay = Layout(width, height, self.graph_height)
+        out: list[list[Seg]] = []
+        out.extend(self._header(snap, lay, live))
+        out.append([])
+        by_kind: dict[str, list[Backend]] = {}
+        for be in snap.backends:
+            by_kind.setdefault(be.kind, []).append(be)
+        for kind in ("llama", "ollama", "lemonade"):
+            group = by_kind.get(kind) or []
+            if not group:
+                continue
+            out.append(self._rule(KIND_TITLE[kind], lay.width))
+            for be in group:
+                out.extend(self._backend(be, lay, 0, live))
+                for child in be.children:
+                    out.extend(self._backend(child, lay, 2, live))
+            out.append([])
+        if not any(by_kind.values()):
+            out.append([("  no backend found.", "dim")])
+        foot = Line(lay.width)
+        foot.add(f"  every {interval:g}s", "dim")
+        if live:
+            foot.add("   q quit   +/- interval   r refresh", "dim")
+        out.append(foot.segs)
+        return out
+
 
 # --------------------------------------------------------------------------
-# Ausgabe: einmalig, JSON, TUI
+# output: one-shot, JSON, TUI
 # --------------------------------------------------------------------------
 
-ANSI = {
-    "": "\033[0m", "dim": "\033[2m", "ok": "\033[32m", "idle": "\033[36m",
-    "warn": "\033[33m", "bad": "\033[31m", "hi": "\033[1m", "title": "\033[1;34m",
-    "label": "\033[2m", "model": "\033[35m",
+ANSI_BASE = {
+    "": "", "dim": "\033[2m", "ok": "\033[32m", "idle": "\033[36m",
+    "warn": "\033[33m", "bad": "\033[31m", "hi": "\033[1m",
+    "title": "\033[1;34m", "label": "\033[2m", "model": "\033[35m",
+    "track": "\033[38;5;236m",
 }
+
+
+def ansi_code(style: str) -> str:
+    if style.startswith("grad"):
+        try:
+            return f"\033[38;5;{GRADIENT[int(style[4:])]}m"
+        except (ValueError, IndexError):
+            return ""
+    return ANSI_BASE.get(style, "")
 
 
 def print_rows(rows: list[list[Seg]], color: bool) -> None:
@@ -1534,7 +1814,8 @@ def print_rows(rows: list[list[Seg]], color: bool) -> None:
             continue
         parts = []
         for text, style in row:
-            parts.append(f"{ANSI.get(style, '')}{text}\033[0m" if style else text)
+            code = ansi_code(style)
+            parts.append(f"{code}{text}\033[0m" if code else text)
         print("".join(parts).rstrip())
 
 
@@ -1563,7 +1844,48 @@ def snapshot_to_dict(snap: Snapshot) -> dict:
     }
 
 
-def run_tui(collector: Collector, interval: float, ascii_mode: bool) -> int:
+def build_pairs(curses) -> dict[str, int]:
+    """Map style names onto curses attributes, gradient included."""
+    pairs: dict[str, int] = {}
+    if not curses.has_colors():
+        return pairs
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        background = -1
+    except curses.error:
+        background = curses.COLOR_BLACK
+    spec = {"ok": curses.COLOR_GREEN, "idle": curses.COLOR_CYAN,
+            "warn": curses.COLOR_YELLOW, "bad": curses.COLOR_RED,
+            "title": curses.COLOR_BLUE, "model": curses.COLOR_MAGENTA}
+    index = 1
+    for name, color in spec.items():
+        curses.init_pair(index, color, background)
+        pairs[name] = curses.color_pair(index)
+        index += 1
+    pairs["hi"] = curses.A_BOLD
+    pairs["dim"] = curses.A_DIM
+    pairs["label"] = curses.A_DIM
+    pairs["title"] |= curses.A_BOLD
+    if curses.COLORS >= 256 and curses.COLOR_PAIRS > index + GRAD_N + 1:
+        for i, color in enumerate(GRADIENT):
+            curses.init_pair(index, color, background)
+            pairs[f"grad{i}"] = curses.color_pair(index)
+            index += 1
+        curses.init_pair(index, 236, background)
+        pairs["track"] = curses.color_pair(index)
+    else:
+        # Eight-colour terminals: collapse the gradient onto green/yellow/red.
+        for i in range(GRAD_N):
+            frac = i / (GRAD_N - 1)
+            pairs[f"grad{i}"] = (pairs["ok"] if frac < 0.45 else
+                                 pairs["warn"] if frac < 0.8 else pairs["bad"])
+        pairs["track"] = curses.A_DIM
+    return pairs
+
+
+def run_tui(collector: Collector, interval: float, ascii_mode: bool,
+            graph_height: str | int) -> int:
     import curses
     import select
     import threading
@@ -1576,7 +1898,7 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool) -> int:
             try:
                 state["snap"] = collector.snapshot()
                 state["err"] = None
-            except Exception as exc:  # Sammeln darf die Anzeige nie killen
+            except Exception as exc:  # collection must never kill the display
                 state["err"] = f"{type(exc).__name__}: {exc}"
             state["force"].wait(state["interval"])
             state["force"].clear()
@@ -1584,37 +1906,26 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool) -> int:
     def draw(stdscr) -> int:
         curses.curs_set(0)
         stdscr.nodelay(True)
-        pairs = {}
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-            spec = {"ok": curses.COLOR_GREEN, "idle": curses.COLOR_CYAN,
-                    "warn": curses.COLOR_YELLOW, "bad": curses.COLOR_RED,
-                    "title": curses.COLOR_BLUE, "model": curses.COLOR_MAGENTA}
-            for i, (name, color) in enumerate(spec.items(), start=1):
-                curses.init_pair(i, color, -1)
-                pairs[name] = curses.color_pair(i)
-            pairs["hi"] = curses.A_BOLD
-            pairs["dim"] = curses.A_DIM
-            pairs["label"] = curses.A_DIM
-            pairs["title"] = pairs["title"] | curses.A_BOLD
+        pairs = build_pairs(curses)
+        renderer = Renderer(ascii_mode, graph_height)
+        threading.Thread(target=worker, daemon=True).start()
 
-        renderer = Renderer(ascii_mode)
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
         while True:
-            while True:  # alle anliegenden Tasten abarbeiten
+            while True:  # drain every pending key
                 try:
                     key = stdscr.getch()
                 except curses.error:
                     key = -1
                 if key == -1:
                     break
-                if key in (ord("q"), ord("Q"), 27):
+                if key == curses.KEY_RESIZE:
+                    curses.update_lines_cols()
+                    stdscr.clear()
+                elif key in (ord("q"), ord("Q"), 27):
                     state["stop"] = True
                     state["force"].set()
                     return 0
-                if key in (ord("+"), ord("=")):
+                elif key in (ord("+"), ord("=")):
                     state["interval"] = min(60.0, state["interval"] + 0.5)
                 elif key == ord("-"):
                     state["interval"] = max(0.5, state["interval"] - 0.5)
@@ -1624,10 +1935,16 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool) -> int:
             height, width = stdscr.getmaxyx()
             stdscr.erase()
             snap = state["snap"]
-            if snap is None:
-                stdscr.addnstr(0, 0, "llmtop sammelt Daten ...", width - 1)
+            if width < 30 or height < 6:
+                try:
+                    stdscr.addnstr(0, 0, "terminal too small", max(0, width - 1))
+                except curses.error:
+                    pass
+            elif snap is None:
+                stdscr.addnstr(0, 0, "llmtop is collecting ...", width - 1)
             else:
-                rows = renderer.rows(snap, width - 1, state["interval"])
+                renderer.feed(snap)
+                rows = renderer.rows(snap, width - 1, height, state["interval"], True)
                 for y, row in enumerate(rows):
                     if y >= height - 1:
                         break
@@ -1644,14 +1961,13 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool) -> int:
                         x += len(chunk)
             if state["err"]:
                 try:
-                    stdscr.addnstr(height - 1, 0, f"Fehler: {state['err']}"[:width - 1],
+                    stdscr.addnstr(height - 1, 0, f"error: {state['err']}"[:width - 1],
                                    width - 1, pairs.get("bad", 0))
                 except curses.error:
                     pass
             stdscr.refresh()
-            # Bewusst select statt curses.napms(): napms gibt die GIL nicht
-            # frei und wuerde den Sammel-Thread aushungern - die Anzeige blieb
-            # dann sekundenlang auf "sammelt Daten" stehen.
+            # select, not curses.napms: napms does not release the GIL and
+            # would starve the collector thread.
             try:
                 select.select([sys.stdin], [], [], 0.12)
             except (OSError, ValueError):
@@ -1663,48 +1979,52 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="llmtop",
-        description="Zustand lokaler LLM-Backends: llama.cpp, Ollama, Lemonade, "
-                    "dazu GPU und NPU.")
+        description="State of local LLM backends: llama.cpp, Ollama, Lemonade, "
+                    "plus GPU and NPU.")
     parser.add_argument("-1", "--once", action="store_true",
-                        help="einmal ausgeben statt TUI")
-    parser.add_argument("--json", action="store_true", help="JSON ausgeben und beenden")
+                        help="print once instead of running the TUI")
+    parser.add_argument("--json", action="store_true", help="print JSON and exit")
     parser.add_argument("-n", "--interval", type=float, default=None,
-                        help="Aktualisierungsintervall in Sekunden (Standard 2)")
+                        help="refresh interval in seconds (default 2)")
+    parser.add_argument("--graph-height", default=None,
+                        help="graph rows: auto (default) or 1-4")
     parser.add_argument("--ascii", action="store_true",
-                        help="nur ASCII, keine Blockzeichen")
-    parser.add_argument("--no-color", action="store_true", help="ohne Farbe (mit --once)")
-    parser.add_argument("--config", help="Pfad zur Konfigurationsdatei")
+                        help="ASCII only, no braille")
+    parser.add_argument("--no-color", action="store_true",
+                        help="no colour (with --once)")
+    parser.add_argument("--config", help="path to a configuration file")
     parser.add_argument("--version", action="version", version=f"llmtop {VERSION}")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     interval = args.interval if args.interval is not None else float(cfg["ui"]["interval"])
     ascii_mode = args.ascii or bool(cfg["ui"].get("ascii"))
+    graph_height = args.graph_height or cfg["ui"].get("graph_height", "auto")
     collector = Collector(cfg)
 
     def sampled() -> Snapshot:
-        """Zweimal messen: CPU-Prozent und tok/s entstehen erst aus dem Delta."""
+        """Measure twice: CPU percentages and tok/s only exist as a delta."""
         collector.snapshot()
         time.sleep(min(1.0, max(0.3, interval / 2)))
         return collector.snapshot()
 
     if args.json:
-        snap = sampled()
-        print(json.dumps(snapshot_to_dict(snap), indent=2, ensure_ascii=False))
+        print(json.dumps(snapshot_to_dict(sampled()), indent=2, ensure_ascii=False))
         return 0
 
     if args.once:
-        snap = sampled()
+        size = shutil.get_terminal_size((100, 30))
         color = sys.stdout.isatty() and not args.no_color
-        print_rows(Renderer(ascii_mode).rows(snap, shutil.get_terminal_size().columns - 1,
-                                             interval), color)
+        rows = Renderer(ascii_mode, graph_height).rows(
+            sampled(), size.columns - 1, size.lines, interval, False)
+        print_rows(rows, color)
         return 0
 
     if not sys.stdout.isatty():
-        print("llmtop: kein Terminal, nutze --once oder --json", file=sys.stderr)
+        print("llmtop: not a terminal, use --once or --json", file=sys.stderr)
         return 2
     try:
-        return run_tui(collector, interval, ascii_mode)
+        return run_tui(collector, interval, ascii_mode, graph_height)
     except KeyboardInterrupt:
         return 0
 

@@ -407,6 +407,44 @@ def drm_proc_stats(pid: int) -> dict | None:
             "engine_ns": sum(c["engine_ns"] for c in clients.values())}
 
 
+LEAD_MIN = 0.10  # below this share of the device nothing counts as leading
+
+
+def leading_device(cpu_frac: float | None, gpu_frac: float | None) -> str | None:
+    """Which device carries a backend: "cpu", "gpu" or None when idle.
+
+    CPU is measured against all logical CPUs, GPU against the one device, so
+    both are a share of what that side has. A GPU model keeps one or two
+    cores polling (a few percent of the machine) while the GPU sits near
+    100%; a CPU model is the other way round.
+    """
+    cpu, gpu = cpu_frac or 0.0, gpu_frac or 0.0
+    if max(cpu, gpu) < LEAD_MIN:
+        return None
+    return "cpu" if cpu > gpu else "gpu"
+
+
+def attribute_gpu(snap: Snapshot) -> None:
+    """Fill in the GPU load of a backend whose own figure is unreadable.
+
+    Services running as their own user (Ollama, Lemonade) hide their fdinfo,
+    so their GPU load is unknown even while they are the only thing on the
+    GPU. When exactly one such backend is working, it gets whatever part of
+    the device load the readable processes do not account for, marked as an
+    estimate. With two or more candidates nothing is guessed.
+    """
+    busy = snap.gpu.get("busy")
+    if busy is None:
+        return
+    leaves = [c for be in snap.backends for c in (be.children or [be])]
+    known = sum(n.gpu_util for n in leaves if n.gpu_util is not None)
+    unknown = [n for n in leaves if n.gpu_util is None
+               and (n.busy or (n.tps or 0) > 0.05)]
+    if len(unknown) == 1:
+        unknown[0].gpu_util = max(0.0, busy - known)
+        unknown[0].gpu_estimated = True
+
+
 class GpuTimeTracker:
     """Per-process GPU load from the cumulative engine time."""
 
@@ -689,6 +727,7 @@ class Backend:
     cpu: float | None = None
     gpu_mem: int | None = None
     gpu_util: float | None = None
+    gpu_estimated: bool = False  # gpu_util inferred from the device total
     tps: float | None = None
     busy: bool = False
     slots_busy: int = 0
@@ -1425,6 +1464,7 @@ class Collector:
             snap.system = f_sys.result()
         llama = self.collect_llama(o_pids | l_pids)
         snap.backends = [*llama, ollama, lemon]
+        attribute_gpu(snap)
         self.cpu.sweep()
         self.gputime.sweep()
         return snap
@@ -1905,12 +1945,25 @@ class Renderer:
         has_load = be.cpu is not None or be.gpu_util is not None or be.tps is not None
         if has_load:
             load.add(indent)
-            for label, value in (("cpu ", be.cpu), ("  gpu ", be.gpu_util)):
-                load.add(label, "label")
-                if value is None:
-                    load.add("     -", "dim")
-                else:
-                    load.add(f"{value:5.1f}%", grad_style(value / 100.0))
+            # CPU in cores: a percentage of one core next to the whole-machine
+            # graph above reads as a contradiction (191% there, 6% here).
+            cpu_frac = be.cpu / 100.0 / (os.cpu_count() or 1) if be.cpu is not None else None
+            gpu_frac = be.gpu_util / 100.0 if be.gpu_util is not None else None
+            lead = leading_device(cpu_frac, gpu_frac)
+            load.add("CPU " if lead == "cpu" else "cpu ", "lead" if lead == "cpu" else "label")
+            if be.cpu is None:
+                load.add("         -", "dim")
+            else:
+                load.add(f"{be.cpu / 100.0:4.1f} cores",
+                         "lead" if lead == "cpu" else grad_style(cpu_frac))
+            load.add("  ")
+            load.add("GPU " if lead == "gpu" else "gpu ", "lead" if lead == "gpu" else "label")
+            if be.gpu_util is None:
+                load.add("     -", "dim")
+            else:
+                text = (f"~{be.gpu_util:.0f}%".rjust(6) if be.gpu_estimated
+                        else f"{be.gpu_util:5.1f}%")
+                load.add(text, "lead" if lead == "gpu" else grad_style(gpu_frac))
             load.add("  ")
             if be.tps is None:
                 load.add(f"{'-':>6} tok/s", "dim")
@@ -2039,6 +2092,7 @@ PALETTE: dict[str, tuple[int, str | None, str]] = {
     "idle":       (74, "cyan", ""),
     "warn":       (179, "yellow", ""),
     "bad":        (203, "red", ""),
+    "lead":       (203, "red", "bold"),  # the device a backend runs on
     "model":      (182, "magenta", ""),
     "track":      (238, None, "dim"),
     # panel frames, one colour per panel like btop's boxes
@@ -2110,6 +2164,7 @@ def backend_to_dict(be: Backend) -> dict:
         "model": be.model, "ctx": be.ctx, "memory_bytes": be.mem,
         "memory_kind": be.mem_kind, "cpu_percent": be.cpu,
         "gpu_memory_bytes": be.gpu_mem, "gpu_percent": be.gpu_util,
+        "gpu_percent_estimated": be.gpu_estimated,
         "tokens_per_second": be.tps, "busy": be.busy,
         "slots_busy": be.slots_busy, "slots_total": be.slots_total,
         "unload_in_seconds": be.idle_in, "since_seconds": be.since,

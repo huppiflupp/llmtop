@@ -26,15 +26,15 @@ Python 3.11+, no dependencies.
 │   deepseek-v4-flash · ngl 999 · model file missing  │         -      ctx   64k  slots     -               │
 ╰─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────╯
 ╭─┐Ollama┌────────────────────────────────────────────┬────────────────────────────────┐1 busy · 1 running┌─╮
-│ ● ollama         running  busy :11434               │ cpu 197.1%  gpu      -    23.7 tok/s ⣀⣀⣀⣀⣀⣸⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ● ollama         running  busy :11434               │ cpu  2.0 cores  gpu      -    23.7 tok/s ⣀⣸⣿⣿⣿⣿⣿⣿⣿⣿ │
 │   granite4.2:latest · v0.34.1-igpu-trust-vram       │  25.1 GiB GPU  ctx  128k  slots   1/1  up 58s       │
 ╰─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────╯
 ╭─┐Lemonade┌──────────────────────────────────────────┬────────────────────────────────┐1 busy · 1 running┌─╮
-│ ● lemonade       running  busy :13311 front: Gemma… │ cpu   0.0%  gpu      -       - tok/s                │
+│ ● lemonade       running  busy :13311 front: Gemma… │ cpu  0.0 cores  gpu      -       - tok/s            │
 │   2 models · v11.6.0 · 188.1k tok total             │ 959.6 MiB RSS  ctx     -  slots     -  up 20h56     │
-│   ● SDXL-Turbo   running       :8002  ready         │ cpu   0.0%  gpu      -       - tok/s                │
+│   ● SDXL-Turbo   running       :8002  ready         │ cpu  0.0 cores  gpu      -       - tok/s            │
 │     SDXL-Turbo · sd-cpp/gpu · image                 │  21.3 MiB RSS  ctx   32k  slots     -  used 2h34 a… │
-│   ● Gemma-4-E4B… running  busy :8001                │ cpu  33.5%  gpu      -    44.5 tok/s ⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│   ● Gemma-4-E4B… running  busy :8001                │ cpu  0.3 cores  gpu      -    44.5 tok/s ⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │     Gemma-4-E4B-it-GGUF · llamacpp/gpu              │ 938.2 MiB RSS  ctx  128k  slots   2/4               │
 ╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.5.0 · every 1s└─╯
 ```
@@ -126,6 +126,16 @@ the key bindings.
 | GPU time per process | `/proc/<pid>/fdinfo`, delta of `drm-engine-*` |
 | GPU overall | `/sys/class/drm/card*/device`, else `nvidia-smi` |
 | NPU | `/sys/class/accel/*`, `xrt-smi examine`, open `/dev/accel/*` handles |
+
+Process CPU is given in cores (1.0 = one full core), so it cannot be mistaken
+for the whole-machine CPU graph above it. The device a backend actually runs on
+is marked in bold red: CPU when it uses a larger share of all logical CPUs than
+of the GPU, GPU the other way round, nothing below 10% of either.
+
+A service running as its own user (Ollama, Lemonade) hides its `fdinfo`, so its
+own GPU time cannot be read. When exactly one backend is working, it is given
+the device load that the readable processes leave over, shown as `~90%`; with
+two or more working at once llmtop does not guess and prints `-`.
 
 `tokens_predicted_total` from `/metrics` is only a fallback: that counter is
 written when a task finishes and stands still during generation. `/slots` counts

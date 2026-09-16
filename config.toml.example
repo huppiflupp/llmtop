@@ -1,0 +1,27 @@
+# ~/.config/llmtop/config.toml - alle Angaben sind freiwillig.
+
+[ui]
+interval = 2.0      # Sekunden zwischen zwei Messungen
+ascii = false       # true: keine Blockzeichen, nur ASCII
+
+[llama]
+# Nach welchen systemd-Units gesucht wird (Benutzer- und Systemebene).
+unit_glob_socket = "llama-*.socket"
+unit_glob_service = "llama-*.service"
+
+[ollama]
+url = "http://127.0.0.1:11434"
+# Fuer die Zuordnung Modell <-> Runner-Prozess. Der erste lesbare zaehlt.
+model_dirs = [
+  "/var/lib/ollama/.ollama/models",
+  "/usr/share/ollama/.ollama/models",
+  "~/.ollama/models",
+]
+
+[lemonade]
+# Wird aus dem laufenden lemond-Prozess uebernommen, falls dieser --port setzt.
+url = "http://127.0.0.1:8000"
+unit = "lemond.service"
+
+[npu]
+xrt_smi = ["/opt/xilinx/xrt/bin/xrt-smi"]

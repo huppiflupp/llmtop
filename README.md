@@ -36,7 +36,7 @@ Python 3.11+, no dependencies.
 │     SDXL-Turbo · sd-cpp/gpu · image                 │  21.3 MiB RSS  ctx   32k  slots     -  used 2h34 a… │
 │   ● Gemma-4-E4B… running  busy :8001                │ cpu  33.5%  gpu      -    44.5 tok/s ⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │     Gemma-4-E4B-it-GGUF · llamacpp/gpu              │ 938.2 MiB RSS  ctx  128k  slots   2/4               │
-╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.4.1 · every 1s└─╯
+╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.5.0 · every 1s└─╯
 ```
 
 ## Why not just extend btop

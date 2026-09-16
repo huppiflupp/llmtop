@@ -13,7 +13,8 @@ Python 3.11+, no dependencies.
 │      AMD RYZEN AI MAX+ 395 w/ Radeon 8060S · 32 th… │      Radeon 8060S · 2737Mhz                         │
 │ CPU  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀    9% │ GPU  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿  100% │
 │      ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀       │      ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿       │
-│ RAM  ⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀  46.6 GiB/124.9 GiB │ GTT  ⣿⣿⣿⣿⡇⣀⣀⣀⣀⣀⣀⣀⣀  40.3 GiB/120.0 GiB   63°C   85W │
+│ RAM  46.6 GiB/124.9 GiB                             │ GTT  40.3 GiB/120.0 GiB                  63°C   85W │
+│      ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤   37% │      ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤   34% │
 │ load 1.93  2.27  1.65                               │ NPU  idle          amdxdna · fw 1.1.2.65 · D3hot    │
 ╰─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────╯
 ╭─┐llama.cpp┌─────────────────────────────────────────┬──────────────────────────────┐2 asleep · 1 stopped┌─╮
@@ -99,8 +100,10 @@ wanders as numbers change length. Below 90 columns the two halves are stacked
 inside the same panels.
 
 Graphs and meters grow and shrink with the window, trailing fields are cut with an
-ellipsis rather than pushed aside, and on short terminals the graphs flatten to
-one row before the bottom panels would get cut off. Resizing keeps the history:
+ellipsis rather than pushed aside, and the graphs take up whatever rows the
+panels leave free, so the screen fills at any window height. As in btop, load
+and memory share that space: CPU with RAM, GPU with GTT. On short terminals the
+graphs flatten to one row before the bottom panels would get cut off. Resizing keeps the history:
 the sample buffer is far wider than any terminal, so a wider window simply reveals
 more of the past.
 

@@ -245,6 +245,17 @@ class Graph:
         return rows
 
 
+def mem_pct(used: float | None, total: float | None) -> float | None:
+    return (used or 0) / total * 100 if total else None
+
+
+def gpu_mem(gpu: dict) -> tuple[str, float | None, float | None]:
+    """The GPU's memory pool: GTT on unified memory, VRAM otherwise."""
+    if gpu.get("gtt_total"):
+        return "GTT", gpu.get("gtt_used"), gpu["gtt_total"]
+    return "VRAM", gpu.get("vram_used"), gpu.get("vram_total")
+
+
 def meter(pct: float | None, width: int, ascii_mode: bool) -> list[Seg]:
     """A horizontal level bar with a left-to-right gradient, like btop's."""
     width = max(1, width)
@@ -1568,7 +1579,7 @@ class Layout:
 
     SPLIT_MIN = 90
 
-    def __init__(self, width: int, height: int, graph_h: int) -> None:
+    def __init__(self, width: int, height: int, graph_rows: int) -> None:
         self.width = max(40, width)
         self.height = max(8, height)
         self.inner = self.width - 4  # inside "│ " ... " │"
@@ -1582,7 +1593,11 @@ class Layout:
             self.divider_col = None
         self.name_w = 18 if self.left_w >= 52 else (14 if self.left_w >= 42 else 11)
         self.show_pid = self.left_w >= 62
-        self.graph_h = graph_h
+        # Load and memory graphs share their rows like btop's boxes: CPU
+        # with RAM, GPU with GTT. An odd row goes to the load graph.
+        graph_rows = max(2, graph_rows)
+        self.graph_h = (graph_rows + 1) // 2
+        self.mem_h = graph_rows // 2
 
 
 MEM_KIND = {"GPU": "GPU", "part GPU": "GPU", "RAM": "RAM", "RSS": "RSS"}
@@ -1629,6 +1644,9 @@ class Renderer:
             g.seen = False
         self.graph("cpu").push(snap.system.get("cpu"))
         self.graph("gpu").push(snap.gpu.get("busy"))
+        self.graph("ram").push(mem_pct(snap.system.get("mem_used"),
+                                       snap.system.get("mem_total")))
+        self.graph("gtt").push(mem_pct(*gpu_mem(snap.gpu)[1:]))
         for be in snap.backends:
             for node in (be, *be.children):
                 if node.tps is not None:
@@ -1724,11 +1742,15 @@ class Renderer:
         return (f"{value:4.0f}%", grad_style(value / 100.0))
 
     def _graph_rows(self, key: str, label: str, value: float | None, width: int,
-                    lay: Layout, live: bool) -> list[list[Seg]]:
-        """Label, history graph (or meter when not live), percentage."""
-        graph_w = max(4, width - LABEL_W - 6)
+                    height: int, live: bool,
+                    tail: list[Seg] | None = None) -> list[list[Seg]]:
+        """Label, history graph (or meter when not live), then `tail` -
+        the percentage unless given."""
+        if tail is None:
+            tail = [(" ", ""), self._pct_seg(value)]
+        graph_w = max(4, width - LABEL_W - sum(len(t) for t, _ in tail))
         if live:
-            body = self.graph(key).render(graph_w, lay.graph_h, 100.0, self.ascii)
+            body = self.graph(key).render(graph_w, height, 100.0, self.ascii)
         else:
             body = [self._meter_segs(value, graph_w)]
         rows = []
@@ -1737,22 +1759,24 @@ class Renderer:
             line.add(f"{label:<4} " if i == 0 else " " * LABEL_W, "label")
             line.add_segs(cells)
             if i == 0:
-                line.add(" ")
-                line.add(*self._pct_seg(value))
+                line.add_segs(tail)
             rows.append(line.padded())
         return rows
 
-    def _meter_row(self, label: str, used: float | None, total: float | None,
-                   width: int, tail: str = "") -> list[Seg]:
-        pct = (used or 0) / total * 100 if total else None
+    def _mem_rows(self, key: str, label: str, used: float | None, total: float | None,
+                  width: int, height: int, live: bool, extra: str = "") -> list[list[Seg]]:
         text = f"{human_bytes(used)}/{human_bytes(total)}".rjust(19)
-        meter_w = max(4, width - LABEL_W - 1 - len(text) - len(tail))
-        line = Line(width)
-        line.add(f"{label:<4} ", "label")
-        line.add_segs(self._meter_segs(pct, meter_w))
-        line.add(" " + text)
-        line.add(tail, "dim")
-        return line.padded()
+        pct = mem_pct(used, total)
+        if not live:
+            return self._graph_rows(key, label, pct, width, height, live,
+                                    [(" " + text, ""), (extra, "dim")])
+        # Live: the figures get a line of their own above the graph, so the
+        # graph lines up with the load graph above it.
+        head = Line(width)
+        head.add(f"{label:<4} ", "label")
+        head.add(text.strip())
+        head.add(extra.rjust(head.left), "dim")
+        return [head.padded(), *self._graph_rows(key, "", pct, width, height, live)]
 
     def _text_row(self, width: int, label: str, text: str, style: str = "dim") -> list[Seg]:
         line = Line(width)
@@ -1785,10 +1809,11 @@ class Renderer:
         if sysinfo.get("threads"):
             cpu_name += f" {self.mid} {sysinfo['threads']} threads"
         left = [self._text_row(lay.left_w, "", cpu_name, "label")]
-        left += self._graph_rows("cpu", "CPU", sysinfo.get("cpu"), lay.left_w, lay, live)
+        left += self._graph_rows("cpu", "CPU", sysinfo.get("cpu"), lay.left_w,
+                                 lay.graph_h, live)
         if sysinfo.get("mem_total"):
-            left.append(self._meter_row("RAM", sysinfo.get("mem_used"),
-                                        sysinfo["mem_total"], lay.left_w))
+            left += self._mem_rows("ram", "RAM", sysinfo.get("mem_used"),
+                                   sysinfo["mem_total"], lay.left_w, lay.mem_h, live)
         if sysinfo.get("load"):
             left.append(self._text_row(lay.left_w, "load", "  ".join(sysinfo["load"]), ""))
 
@@ -1798,18 +1823,17 @@ class Renderer:
             if gpu.get("sclk"):
                 name += f" {self.mid} {gpu['sclk']}"
             right.append(self._text_row(lay.right_w, "", name, "label"))
-            right += self._graph_rows("gpu", "GPU", gpu.get("busy"), lay.right_w, lay, live)
+            right += self._graph_rows("gpu", "GPU", gpu.get("busy"), lay.right_w,
+                                      lay.graph_h, live)
             tail = ""
             if gpu.get("temp") is not None or gpu.get("watt") is not None:
                 temp = f"{gpu['temp']:4.0f}°C" if gpu.get("temp") is not None else " " * 6
                 watt = f"{gpu['watt']:5.0f}W" if gpu.get("watt") is not None else " " * 6
                 tail = f" {temp}{watt}"
-            if gpu.get("gtt_total"):
-                right.append(self._meter_row("GTT", gpu.get("gtt_used"),
-                                             gpu["gtt_total"], lay.right_w, tail))
-            elif gpu.get("vram_total"):
-                right.append(self._meter_row("VRAM", gpu.get("vram_used"),
-                                             gpu["vram_total"], lay.right_w, tail))
+            label, used, total = gpu_mem(gpu)
+            if total:
+                right += self._mem_rows("gtt", label, used, total, lay.right_w,
+                                        lay.mem_h, live, tail)
         if npu:
             right.append(self._npu_row(npu, lay.right_w))
 
@@ -1936,17 +1960,23 @@ class Renderer:
     def rows(self, snap: Snapshot, width: int, height: int, interval: float,
              live: bool) -> list[list[Seg]]:
         if self.graph_height == "auto":
-            # Tall graphs when they fit, otherwise flatten them before the
-            # bottom panels get cut off.
+            # Graphs take up whatever rows the panels leave free, so the
+            # screen fills at any window height. Each extra graph row adds
+            # the same number of lines (one split, two stacked), so one
+            # trial build is enough to size them.
             out = self._build(snap, Layout(width, height, 2), interval, live)
-            if len(out) <= height:
+            spare = height - len(out)
+            if spare <= 0:
                 return out
-            return self._build(snap, Layout(width, height, 1), interval, live)
+            step = len(self._build(snap, Layout(width, height, 3), interval, live)) - len(out)
+            if step <= 0:
+                return out
+            return self._build(snap, Layout(width, height, 2 + spare // step), interval, live)
         try:
             gh = max(1, min(4, int(self.graph_height)))
         except (TypeError, ValueError):
             gh = 1
-        return self._build(snap, Layout(width, height, gh), interval, live)
+        return self._build(snap, Layout(width, height, 2 * gh), interval, live)
 
     def _build(self, snap: Snapshot, lay: Layout, interval: float,
                live: bool) -> list[list[Seg]]:

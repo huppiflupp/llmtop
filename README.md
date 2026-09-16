@@ -65,7 +65,7 @@ inzwischen, steht das dabei.
 Eine Datei, Python ≥ 3.11, keine Abhängigkeiten.
 
 ```bash
-git clone https://github.com/<user>/llmtop.git
+git clone https://github.com/huppiflupp/llmtop.git
 install -m 755 llmtop/llmtop.py ~/.local/bin/llmtop
 llmtop
 ```

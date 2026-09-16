@@ -1811,12 +1811,17 @@ class Renderer:
             return self._graph_rows(key, label, pct, width, height, live,
                                     [(" " + text, ""), (extra, "dim")])
         # Live: the figures get a line of their own above the graph, so the
-        # graph lines up with the load graph above it.
+        # graph lines up with the load graph above it. The percentage stays
+        # on that line too, in the load graph's column - on the graph's first
+        # row it sat next to whatever line followed and read as part of it.
         head = Line(width)
         head.add(f"{label:<4} ", "label")
         head.add(text.strip())
-        head.add(extra.rjust(head.left), "dim")
-        return [head.padded(), *self._graph_rows(key, "", pct, width, height, live)]
+        head.add(extra.rjust(head.left - 6), "dim")
+        head.add(" ")
+        head.add(*self._pct_seg(pct))
+        return [head.padded(),
+                *self._graph_rows(key, "", pct, width, height, live, [(" " * 6, "")])]
 
     def _text_row(self, width: int, label: str, text: str, style: str = "dim") -> list[Seg]:
         line = Line(width)

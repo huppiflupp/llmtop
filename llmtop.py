@@ -1013,6 +1013,59 @@ class Collector:
                 path = path[1:]
         return f"{'/'.join(path)}:{tag}"
 
+    # -- benchmarks and measurement runs ----------------------------------
+
+    @staticmethod
+    def _proc_age(pid: int) -> float | None:
+        """Seconds since the process started (stat field 22, in clock ticks)."""
+        raw = read_text(f"/proc/{pid}/stat")
+        up = read_text("/proc/uptime")
+        if not raw or not up:
+            return None
+        try:
+            start = int(raw[raw.rindex(")") + 2:].split()[19])
+            return max(0.0, float(up.split()[0]) - start / os.sysconf("SC_CLK_TCK"))
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _environ(pid: int, key: str) -> str | None:
+        raw = read_text(f"/proc/{pid}/environ")
+        if not raw:
+            return None
+        prefix = key + "="
+        return next((e[len(prefix):] for e in raw.split("\0") if e.startswith(prefix)), None)
+
+    def collect_bench(self, owned_pids: set[int]) -> list[Backend]:
+        """Programs that load the machine but serve no API: llama-bench,
+        llama-perplexity, colibri runs, bandwidth probes. Without this they
+        show up only as unexplained CPU/GPU load (no tok/s to read)."""
+        names = self.cfg.get("bench", {}).get("programs", [])
+        if not names:
+            return []
+        pattern = re.compile("^(" + "|".join(re.escape(n) for n in names) + ")$")
+        procs = proc_all()
+        found = proc_scan(pattern, procs)
+        pids = {p.pid for p in found}
+        out = []
+        for proc in found:
+            # A re-exec'd or forked worker of a program already listed is the
+            # same run (colibri re-execs itself once for OpenMP tuning).
+            if proc.ppid in pids or proc.pid in owned_pids or proc.ppid in owned_pids:
+                continue
+            prog = os.path.basename(proc.argv[0]) if proc.argv else proc.comm
+            cfg = parse_llama_argv(proc.argv)
+            model = cfg.get("model")
+            if not model and prog == "colibri":
+                model = self._environ(proc.pid, "SNAP") or self._environ(proc.pid, "COLI_MODEL")
+            be = Backend(kind="bench", name=prog, state=RUNNING,
+                         detail="no API", pid=proc.pid, model=model_label(model),
+                         mem=proc.rss, mem_kind="RSS", since=self._proc_age(proc.pid))
+            be.cpu = self.cpu.percent(proc.pid, proc.cpu_ticks)
+            self._attach_gpu(be)
+            out.append(be)
+        return out
+
     def collect_ollama(self) -> tuple[Backend, set[int]]:
         host = self.cfg["ollama"]["url"].rstrip("/")
         be = Backend(kind="ollama", name="ollama")
@@ -1463,7 +1516,8 @@ class Collector:
             snap.npu = f_npu.result()
             snap.system = f_sys.result()
         llama = self.collect_llama(o_pids | l_pids)
-        snap.backends = [*llama, ollama, lemon]
+        bench = self.collect_bench(o_pids | l_pids)
+        snap.backends = [*llama, ollama, lemon, *bench]
         attribute_gpu(snap)
         self.cpu.sweep()
         self.gputime.sweep()
@@ -1490,6 +1544,9 @@ DEFAULT_CFG: dict = {
         ],
     },
     "lemonade": {"url": "http://127.0.0.1:8000", "unit": "lemond.service"},
+    "bench": {"programs": ["llama-bench", "llama-perplexity", "llama-batched-bench",
+                           "llama-cli", "colibri", "xdna_energy_bench", "cpu_stream",
+                           "gpu_bw", "gpu_import"]},
     "npu": {"xrt_smi": ["/opt/xilinx/xrt/bin/xrt-smi",
                         "/opt/xilinx/xrt/bin/unwrapped/xrt-smi"]},
 }
@@ -1539,7 +1596,8 @@ def load_config(path: str | None) -> dict:
 STATE_STYLE = {RUNNING: "ok", SLEEPING: "idle", STOPPED: "warn", ABSENT: "dim"}
 STATE_WORD = {RUNNING: "running", SLEEPING: "asleep", STOPPED: "stopped",
               ABSENT: "absent"}
-KIND_TITLE = {"llama": "llama.cpp", "ollama": "Ollama", "lemonade": "Lemonade"}
+KIND_TITLE = {"llama": "llama.cpp", "ollama": "Ollama", "lemonade": "Lemonade",
+              "bench": "benchmarks"}
 
 
 ELLIPSIS = "…"
@@ -1643,7 +1701,7 @@ class Layout:
 MEM_KIND = {"GPU": "GPU", "part GPU": "GPU", "RAM": "RAM", "RSS": "RSS"}
 LABEL_W = 5  # "CPU  "
 BOX_STYLE = {"system": "b_system", "llama": "b_llama",
-             "ollama": "b_ollama", "lemonade": "b_lemonade"}
+             "ollama": "b_ollama", "lemonade": "b_lemonade", "bench": "b_bench"}
 
 
 class Renderer:
@@ -2042,7 +2100,7 @@ class Renderer:
         by_kind: dict[str, list[Backend]] = {}
         for be in snap.backends:
             by_kind.setdefault(be.kind, []).append(be)
-        kinds = [k for k in ("llama", "ollama", "lemonade") if by_kind.get(k)]
+        kinds = [k for k in ("llama", "ollama", "lemonade", "bench") if by_kind.get(k)]
 
         keys: list[Seg] = []
         if live:
@@ -2105,6 +2163,7 @@ PALETTE: dict[str, tuple[int, str | None, str]] = {
     "b_llama":    (137, "yellow", ""),
     "b_ollama":   (61, "blue", ""),
     "b_lemonade": (131, "red", ""),
+    "b_bench":    (103, "blue", ""),
 }
 
 

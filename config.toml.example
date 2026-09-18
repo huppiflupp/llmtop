@@ -25,5 +25,11 @@ model_dirs = [
 url = "http://127.0.0.1:8000"
 unit = "lemond.service"
 
+[bench]
+# Programs listed in the "benchmarks" panel: matched by program name only, never
+# by command line (earlyoom names llama-server in its own arguments).
+programs = ["llama-bench", "llama-perplexity", "llama-batched-bench", "llama-cli",
+            "colibri", "xdna_energy_bench", "cpu_stream", "gpu_bw", "gpu_import"]
+
 [npu]
 xrt_smi = ["/opt/xilinx/xrt/bin/xrt-smi"]

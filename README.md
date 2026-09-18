@@ -126,6 +126,12 @@ the key bindings.
 | GPU time per process | `/proc/<pid>/fdinfo`, delta of `drm-engine-*` |
 | GPU overall | `/sys/class/drm/card*/device`, else `nvidia-smi` |
 | NPU | `/sys/class/accel/*`, `xrt-smi examine`, open `/dev/accel/*` handles |
+| Benchmarks and measurement runs | processes by program name (`llama-bench`, `llama-perplexity`, `colibri`, …), `/proc/<pid>` and its `fdinfo` |
+
+Programs that load the machine without serving an API, such as `llama-bench`,
+`llama-perplexity` or a `colibri` run, get their own **benchmarks** panel. They
+have no tok/s to read, but without the panel their load showed up with no
+source at all. The list of program names is configurable (`[bench]`).
 
 Process CPU is given in cores (1.0 = one full core), so it cannot be mistaken
 for the whole-machine CPU graph above it. The device a backend actually runs on

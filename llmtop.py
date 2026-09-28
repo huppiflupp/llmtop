@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -527,6 +528,37 @@ class RateTracker:
         return delta / elapsed
 
 
+class FinishedRate:
+    """tokens/s of the requests that finished between two scrapes.
+
+    llama.cpp's /metrics (and servers that copy its names) write a token counter
+    and a seconds counter when a request ENDS, so a rate over wall time jumps and
+    falls back to zero. Dividing the two deltas instead gives what the server
+    itself reports per request. The last value is held until the next request
+    finishes; the first scrape starts from the lifetime average.
+    """
+
+    def __init__(self) -> None:
+        self._prev: dict[str, tuple[float, float]] = {}
+        self._last: dict[str, float] = {}
+
+    def rate(self, key: str, tokens: float | None, seconds: float | None) -> float | None:
+        if tokens is None or seconds is None:
+            return None
+        prev = self._prev.get(key)
+        self._prev[key] = (tokens, seconds)
+        if prev is None:
+            if tokens > 0 and seconds > 0:
+                self._last[key] = tokens / seconds
+        else:
+            d_tok, d_sec = tokens - prev[0], seconds - prev[1]
+            if d_tok < 0 or d_sec < 0:  # the server restarted
+                self._last.pop(key, None)
+            elif d_tok > 0 and d_sec > 0:
+                self._last[key] = d_tok / d_sec
+        return self._last.get(key)
+
+
 # --------------------------------------------------------------------------
 # reading llama-server command lines
 # --------------------------------------------------------------------------
@@ -765,6 +797,7 @@ class Collector:
         self.cpu = CpuTracker()
         self.gputime = GpuTimeTracker()
         self.rates = RateTracker()
+        self.finished = FinishedRate()
         self.guarded_ports: set[int] = set()
         self._npu_name: str | None = None
         self._npu_probed = False
@@ -909,6 +942,87 @@ class Collector:
                                  bool(cfg.get("metrics")))
             backends.append(be)
         return backends
+
+    # -- configured endpoints -----------------------------------------------
+
+    def collect_endpoints(self, llama: list[Backend]) -> list[Backend]:
+        """Servers named in [endpoints] urls: found neither as a unit nor as a
+        process (a container, another host, an engine with its own binary name)
+        but speaking llama.cpp's HTTP API."""
+        seen = {be.port for be in llama if be.port}
+        backends: list[Backend] = []
+        for url in self.cfg["endpoints"].get("urls") or []:
+            be = self._llama_endpoint(str(url), seen)
+            if be:
+                backends.append(be)
+        return backends
+
+    def _llama_endpoint(self, url: str, seen_ports: set[int]) -> Backend | None:
+        """A llama.cpp-compatible server named in the config, measured over HTTP only."""
+        parts = urllib.parse.urlsplit(url if "://" in url else f"http://{url}")
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        if host in ("127.0.0.1", "localhost", "::1") and port in seen_ports:
+            return None  # already shown as a unit or a process
+        base = f"{parts.scheme or 'http'}://{host}:{port}"
+        be = Backend(kind="endpoint", name=f"{host}:{port}", detail="http", port=port)
+        models = http_json(f"{base}/v1/models")
+        if not isinstance(models, dict):
+            be.state = STOPPED
+            be.extras.append("unreachable")
+            return be
+        be.state = RUNNING
+        data = models.get("data") or []
+        first = data[0] if data and isinstance(data[0], dict) else {}
+        be.model = model_label(None, first.get("id")) if first.get("id") else "-"
+        owner = first.get("owned_by")
+        if owner and owner != "llamacpp":
+            be.name = f"{owner}:{port}"
+        meta = first.get("meta") if isinstance(first.get("meta"), dict) else {}
+        be.ctx = meta.get("n_ctx") or first.get("max_model_len") or first.get("context_length")
+        slots = http_json(f"{base}/slots")
+        if isinstance(slots, list):
+            self._llama_live(be, host, port, True)
+        else:
+            self._metrics_live(be, base)
+        return be
+
+    def _metrics_live(self, be: Backend, base: str) -> None:
+        """Busy and speed from /metrics alone, for servers without /slots."""
+        text = http_text(f"{base}/metrics")
+        if not text:
+            be.extras.append("no /metrics")
+            return
+        vals: dict[str, float] = {}
+        for line in text.splitlines():
+            if not line.startswith("llamacpp:"):
+                continue
+            name, _, rest = line.partition(" ")
+            try:
+                vals[name[len("llamacpp:"):]] = float(rest.split()[0])
+            except (ValueError, IndexError):
+                pass
+        processing = vals.get("requests_processing")
+        if processing is not None:
+            be.slots_busy = int(processing)
+            be.busy = processing > 0
+        last = self.finished.rate(f"tg:{base}", vals.get("tokens_predicted_total"),
+                                  vals.get("tokens_predicted_seconds_total"))
+        pp = self.finished.rate(f"pp:{base}", vals.get("prompt_tokens_total"),
+                                vals.get("prompt_seconds_total"))
+        # The counters only move when a request ends, so there is no live rate. While the
+        # server is busy the last request's speed stands in for it; when it is idle the
+        # tok/s column says so (0.0, dimmed, graph at zero) and the figure moves to the extras,
+        # rather than looking like generation that is not happening.
+        if last is not None:
+            if be.busy:
+                be.tps = last
+                be.extras.append("tok/s of the last request")
+            else:
+                be.tps = 0.0  # idle: dimmed 0.0, graph at zero, row stays in place
+                be.extras.append(f"last request {last:.1f} tok/s")
+        if pp is not None:
+            be.extras.append(f"prompt {pp:.0f} tok/s")
 
     def _llama_from_unit(self, service: str, user_scope: bool,
                          socket_unit: str | None, listen: str) -> Backend | None:
@@ -1516,8 +1630,9 @@ class Collector:
             snap.npu = f_npu.result()
             snap.system = f_sys.result()
         llama = self.collect_llama(o_pids | l_pids)
+        endpoints = self.collect_endpoints(llama)
         bench = self.collect_bench(o_pids | l_pids)
-        snap.backends = [*llama, ollama, lemon, *bench]
+        snap.backends = [*llama, *endpoints, ollama, lemon, *bench]
         attribute_gpu(snap)
         self.cpu.sweep()
         self.gputime.sweep()
@@ -1535,6 +1650,7 @@ DEFAULT_CFG: dict = {
         "unit_glob_socket": "llama-*.socket",
         "unit_glob_service": "llama-*.service",
     },
+    "endpoints": {"urls": []},
     "ollama": {
         "url": "http://127.0.0.1:11434",
         "model_dirs": [
@@ -1596,7 +1712,8 @@ def load_config(path: str | None) -> dict:
 STATE_STYLE = {RUNNING: "ok", SLEEPING: "idle", STOPPED: "warn", ABSENT: "dim"}
 STATE_WORD = {RUNNING: "running", SLEEPING: "asleep", STOPPED: "stopped",
               ABSENT: "absent"}
-KIND_TITLE = {"llama": "llama.cpp", "ollama": "Ollama", "lemonade": "Lemonade",
+KIND_TITLE = {"llama": "llama.cpp", "endpoint": "Endpoints", "ollama": "Ollama",
+              "lemonade": "Lemonade",
               "bench": "benchmarks"}
 
 
@@ -1700,7 +1817,7 @@ class Layout:
 
 MEM_KIND = {"GPU": "GPU", "part GPU": "GPU", "RAM": "RAM", "RSS": "RSS"}
 LABEL_W = 5  # "CPU  "
-BOX_STYLE = {"system": "b_system", "llama": "b_llama",
+BOX_STYLE = {"system": "b_system", "llama": "b_llama", "endpoint": "b_endpoint",
              "ollama": "b_ollama", "lemonade": "b_lemonade", "bench": "b_bench"}
 
 
@@ -2100,7 +2217,8 @@ class Renderer:
         by_kind: dict[str, list[Backend]] = {}
         for be in snap.backends:
             by_kind.setdefault(be.kind, []).append(be)
-        kinds = [k for k in ("llama", "ollama", "lemonade", "bench") if by_kind.get(k)]
+        kinds = [k for k in ("llama", "endpoint", "ollama", "lemonade", "bench")
+                 if by_kind.get(k)]
 
         keys: list[Seg] = []
         if live:
@@ -2161,6 +2279,7 @@ PALETTE: dict[str, tuple[int, str | None, str]] = {
     # panel frames, one colour per panel like btop's boxes
     "b_system":   (65, "green", ""),
     "b_llama":    (137, "yellow", ""),
+    "b_endpoint": (73, "cyan", ""),
     "b_ollama":   (61, "blue", ""),
     "b_lemonade": (131, "red", ""),
     "b_bench":    (103, "blue", ""),

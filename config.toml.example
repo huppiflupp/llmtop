@@ -11,6 +11,15 @@ background = 234      # xterm-256 colour index, or "none" for the terminal's own
 unit_glob_socket = "llama-*.socket"
 unit_glob_service = "llama-*.service"
 
+[endpoints]
+# Servers that speak llama.cpp's HTTP API but that llmtop cannot find as a unit or a
+# process: one in a container, on another host, or an engine with its own binary
+# name. They get their own "Endpoints" panel. Measured over HTTP only (/v1/models,
+# /slots or else /metrics), so no process CPU, memory or GPU figures. Without /slots,
+# tok/s is the speed of the last finished request, shown while the server is
+# busy; when idle it shows 0.0 and the figure moves to the line below.
+urls = []   # e.g. ["http://127.0.0.1:8092"]
+
 [ollama]
 url = "http://127.0.0.1:11434"
 # Used to match a loaded model to its runner process. First readable one wins.

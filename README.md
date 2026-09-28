@@ -36,7 +36,7 @@ Python 3.11+, no dependencies.
 │     SDXL-Turbo · sd-cpp/gpu · image                 │  21.3 MiB RSS  ctx   32k  slots     -  used 2h34 a… │
 │   ● Gemma-4-E4B… running  busy :8001                │ cpu  0.3 cores  gpu      -    44.5 tok/s ⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │     Gemma-4-E4B-it-GGUF · llamacpp/gpu              │ 938.2 MiB RSS  ctx  128k  slots   2/4               │
-╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.8.1 · every 1s└─╯
+╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.9.0 · every 1s└─╯
 ```
 
 ## Why not just extend btop
@@ -86,10 +86,43 @@ llmtop --once           # print once and exit (meters instead of history)
 llmtop --json           # machine readable, for scripts and status bars
 llmtop --graph-height 3 # taller graphs; default adapts to the window
 llmtop --background 16  # another xterm-256 background, or "none"
+llmtop --theme orange   # a colour theme: default, orange, or any btop theme
 llmtop --ascii          # no braille or box drawing, plain ASCII
 ```
 
-Keys: `q` quit, `+`/`-` interval, `r` refresh now.
+Keys: `q` quit, `m` menu, `+`/`-` interval, `r` refresh now.
+
+### Menu
+
+`m` opens a menu over the panels, as in btop: the settings on one tab, the
+endpoints on the other (`Tab` switches). `↑`/`↓` pick a setting, `←`/`→` change
+it, and every change applies at once - theme, graph colours, interval, graph
+height, background, ASCII mode. On the endpoints tab `a` adds a server (type
+its URL, `Enter`), `u` and `n` edit URL and name, `d` deletes, and `Enter`
+tests the selected one right away: the line below shows what answers there
+(`llama.cpp · b392 · qwen3.6-35b-a3b · ctx 256k`) or `unreachable`. New
+endpoints appear in the Endpoints panel immediately. `s` writes everything to
+the config file, `Esc` closes the menu.
+
+Saving edits the file line by line: only the keys the menu knows are touched,
+comments and other sections stay, and the previous file is kept as
+`config.toml.bak`.
+
+### Themes
+
+`theme` in `[ui]` (or `--theme`) picks the colours: `default` is llmtop's own,
+`orange` is bundled, and any btop theme works by name (`dracula`, `nord`,
+`gruvbox_dark`, …) when btop is installed - llmtop looks in
+`~/.config/llmtop/themes`, `~/.config/btop/themes` and `/usr/share/btop/themes` -
+or by path to a `.theme` file. btop's keys are mapped onto llmtop's styles:
+text, titles and highlights as in btop, the four box colours onto the panel
+frames, `div_line` onto the empty part of the graphs, the CPU gradient onto
+the graphs and meters, and `temp_end` onto "busy". Colours are quantised to
+xterm-256, so a theme looks close to btop's, not identical.
+
+`graph_colors = "default"` keeps llmtop's green-yellow-red gradient inside a
+theme's frames and text - orange with colourful graphs. `background = "theme"`
+(the default) takes the theme's background, `"none"` the terminal's own.
 
 ### Layout
 
@@ -191,7 +224,8 @@ and does **not** appear in RSS at all — a 30B model shows up there as 99 MiB. 
 Without any configuration the usual addresses are tried and services are found by
 their processes; `OLLAMA_HOST`, `OLLAMA_MODELS` and `LEMONADE_URL` are honoured.
 For anything unusual: `~/.config/llmtop/config.toml`, see
-[`config.toml.example`](config.toml.example).
+[`config.toml.example`](config.toml.example). The `[ui]` settings and the
+endpoints can also be changed and saved from the menu (`m`).
 
 ## License
 

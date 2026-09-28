@@ -1,10 +1,17 @@
 # ~/.config/llmtop/config.toml - every entry is optional.
+# The [ui] settings and the endpoints can also be set from the menu (m) and
+# saved with s; that edits only these lines and keeps a .bak of the file.
 
 [ui]
 interval = 2.0        # seconds between measurements
 ascii = false         # true: plain ASCII instead of braille
 graph_height = "auto" # "auto", or 1-4 rows per graph
-background = 234      # xterm-256 colour index, or "none" for the terminal's own
+theme = "default"     # "default", "orange", a btop theme by name (dracula, nord, ...)
+                      # from ~/.config/llmtop/themes, ~/.config/btop/themes or
+                      # /usr/share/btop/themes, or the path to a .theme file
+graph_colors = "theme" # "theme": the theme's gradient; "default": llmtop's green to
+                       # red inside the theme's frames and text
+background = "theme"  # "theme", "none" for the terminal's own, or an xterm-256 index
 
 [llama]
 # Which systemd units to look for, in the user and system scopes.

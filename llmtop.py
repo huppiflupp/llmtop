@@ -38,7 +38,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -1829,7 +1829,7 @@ class Collector:
 
 DEFAULT_CFG: dict = {
     "ui": {"interval": 2.0, "ascii": False, "graph_height": "auto",
-           "background": 234},
+           "background": "theme", "theme": "default", "graph_colors": "theme"},
     "llama": {
         "unit_glob_socket": "llama-*.socket",
         "unit_glob_service": "llama-*.service",
@@ -1852,13 +1852,18 @@ DEFAULT_CFG: dict = {
 }
 
 
+CONFIG_PATH: str | None = None  # the file load_config read, or would write
+
+
 def load_config(path: str | None) -> dict:
+    global CONFIG_PATH
     cfg = json.loads(json.dumps(DEFAULT_CFG))  # deep copy
     candidates = [path] if path else [
         os.environ.get("LLMTOP_CONFIG"),
         os.path.join(os.environ.get("XDG_CONFIG_HOME",
                                     os.path.expanduser("~/.config")), "llmtop", "config.toml"),
     ]
+    CONFIG_PATH = next(c for c in candidates if c)
     for cand in candidates:
         if not cand or not os.path.isfile(cand) or tomllib is None:
             continue
@@ -1873,6 +1878,7 @@ def load_config(path: str | None) -> dict:
                 cfg.setdefault(section, {}).update(values)
             else:
                 cfg[section] = values
+        CONFIG_PATH = cand
         break
 
     host = os.environ.get("OLLAMA_HOST")
@@ -2007,8 +2013,14 @@ BOX_STYLE = {"system": "b_system", "llama": "b_llama", "endpoint": "b_endpoint",
 
 class Renderer:
     def __init__(self, ascii_mode: bool, graph_height: str | int = "auto") -> None:
-        self.ascii = ascii_mode
         self.graph_height = graph_height
+        self.graphs: dict[str, Graph] = {}
+        self._last_fed = -1.0
+        self.set_ascii(ascii_mode)
+
+    def set_ascii(self, ascii_mode: bool) -> None:
+        """Switch the drawing characters; the graph history stays."""
+        self.ascii = ascii_mode
         if ascii_mode:
             self.dot_on, self.dot_off, self.mid = "*", "o", "|"
             self.h, self.v = "-", "|"
@@ -2022,8 +2034,6 @@ class Renderer:
             self.tees = ("┬", "┴")
             self.tab_top = ("┐", "┌")      # ┐title┌ like btop
             self.tab_bottom = ("┘", "└")   # ┘title└
-        self.graphs: dict[str, Graph] = {}
-        self._last_fed = -1.0
 
     # -- history ----------------------------------------------------------
 
@@ -2406,7 +2416,8 @@ class Renderer:
 
         keys: list[Seg] = []
         if live:
-            for key, word in (("q", " quit  "), ("+/-", " interval  "), ("r", " refresh")):
+            for key, word in (("q", " quit  "), ("m", " menu  "), ("+/-", " interval  "),
+                              ("r", " refresh")):
                 keys += [(key, "hi"), (word, "label")]
         footer = {"left": keys or None,
                   "right": [(f"llmtop {VERSION} {self.mid} every {interval:g}s", "label")]}
@@ -2445,8 +2456,10 @@ class Renderer:
 DEFAULT_BACKGROUND = 234  # xterm-256 dark grey
 BASE_FG = 252
 
-# style -> (xterm-256 foreground, 8-colour fallback, attribute)
-PALETTE: dict[str, tuple[int, str | None, str]] = {
+Spec = tuple[int, str | None, str]  # (xterm-256 foreground, 8-colour fallback, attribute)
+
+# llmtop's own colours, style -> spec
+DEFAULT_PALETTE: dict[str, Spec] = {
     "":           (BASE_FG, None, ""),
     "dim":        (243, None, "dim"),
     "label":      (246, None, ""),
@@ -2469,33 +2482,273 @@ PALETTE: dict[str, tuple[int, str | None, str]] = {
     "b_bench":    (103, "blue", ""),
 }
 
+# The green-yellow-red load gradient, with 8-colour fallbacks.
+DEFAULT_GRADIENT: tuple[Spec, ...] = tuple(
+    (GRADIENT[i], "green" if i / (GRAD_N - 1) < 0.45 else
+     "yellow" if i / (GRAD_N - 1) < 0.8 else "red", "")
+    for i in range(GRAD_N))
 
-def style_spec(style: str) -> tuple[int, str | None, str]:
-    if style.startswith("grad"):
+RGB = tuple[int, int, int]
+
+
+class Theme:
+    """Colours for every style name, the graph gradient and the background.
+
+    "default" is llmtop's own. Every other theme is a btop theme - the bundled
+    "orange" or any .theme file by name or path - mapped onto llmtop's styles
+    and quantised to xterm-256, since curses has no dependable 24-bit colour.
+    """
+
+    def __init__(self, name: str, palette: dict[str, Spec], gradient: tuple[Spec, ...],
+                 background: int | None) -> None:
+        self.name = name
+        self.palette = palette
+        self.gradient = gradient
+        self.background = background  # None: the terminal's own
+
+    def spec(self, style: str) -> Spec:
+        if style.startswith("grad"):
+            try:
+                idx = int(style[4:])
+            except ValueError:
+                return self.palette[""]
+            return self.gradient[max(0, min(GRAD_N - 1, idx))]
+        return self.palette.get(style, self.palette[""])
+
+
+DEFAULT_THEME = Theme("default", DEFAULT_PALETTE, DEFAULT_GRADIENT, DEFAULT_BACKGROUND)
+
+# btop's orange theme (by neocerambyx), bundled so it works without btop installed.
+BUILTIN_THEMES: dict[str, dict[str, str]] = {
+    "orange": {
+        "main_fg": "#ffa500", "title": "#ffa500", "hi_fg": "#ffcc66",
+        "inactive_fg": "#4d3200", "proc_misc": "#ffa500",
+        "cpu_box": "#ffa500", "mem_box": "#ffa500", "net_box": "#ffa500",
+        "proc_box": "#ffa500", "div_line": "#332100",
+        "temp_start": "#996300", "temp_end": "#ffa500",
+        "cpu_start": "#996300", "cpu_end": "#ffa500",
+    },
+}
+
+CUBE = (0, 95, 135, 175, 215, 255)
+
+
+def hex_to_rgb(text: str) -> RGB | None:
+    t = text.strip().lstrip("#")
+    if len(t) == 3:
+        t = "".join(ch * 2 for ch in t)
+    if len(t) != 6:
+        return None
+    try:
+        return (int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16))
+    except ValueError:
+        return None
+
+
+def rgb_to_256(rgb: RGB) -> int:
+    """The nearest xterm-256 colour: the 6x6x6 cube or the grey ramp."""
+    r, g, b = rgb
+    best, best_d = 16, 1 << 30
+    for i, cr in enumerate(CUBE):
+        for j, cg in enumerate(CUBE):
+            for k, cb in enumerate(CUBE):
+                d = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
+                if d < best_d:
+                    best, best_d = 16 + 36 * i + 6 * j + k, d
+    for i in range(24):
+        v = 8 + 10 * i
+        d = (r - v) ** 2 + (g - v) ** 2 + (b - v) ** 2
+        if d < best_d:
+            best, best_d = 232 + i, d
+    return best
+
+
+def basic_name(rgb: RGB) -> str | None:
+    """The nearest of curses' six colours, or None for a grey."""
+    hi, lo = max(rgb), min(rgb)
+    if hi - lo < 40:
+        return None
+    norm = tuple((c - lo) / (hi - lo) for c in rgb)
+    names = {"red": (1, 0, 0), "green": (0, 1, 0), "blue": (0, 0, 1),
+             "yellow": (1, 1, 0), "cyan": (0, 1, 1), "magenta": (1, 0, 1)}
+    return min(names, key=lambda n: sum((a - b) ** 2 for a, b in zip(norm, names[n])))
+
+
+def mix(a: RGB, b: RGB, t: float) -> RGB:
+    return tuple(int(round(x + (y - x) * t)) for x, y in zip(a, b))  # type: ignore[return-value]
+
+
+def rgb_spec(rgb: RGB, attr: str = "") -> Spec:
+    return (rgb_to_256(rgb), basic_name(rgb), attr)
+
+
+def gradient_specs(stops: list[RGB]) -> tuple[Spec, ...]:
+    """GRAD_N steps through the colour stops, like btop's start/mid/end."""
+    out: list[Spec] = []
+    for i in range(GRAD_N):
+        pos = i / (GRAD_N - 1) * (len(stops) - 1)
+        j = min(int(pos), max(0, len(stops) - 2))
+        rgb = mix(stops[j], stops[j + 1], pos - j) if len(stops) > 1 else stops[0]
+        out.append(rgb_spec(rgb))
+    return tuple(out)
+
+
+def read_btop_theme(path: str) -> dict[str, str]:
+    """theme[key]="#hex" lines -> {key: "#hex"}; empty values are left out."""
+    colours: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r'\s*theme\[(\w+)\]\s*=\s*"([^"]*)"', line)
+                if m and m.group(2).strip():
+                    colours[m.group(1)] = m.group(2).strip()
+    except OSError:
+        pass
+    return colours
+
+
+def theme_from_btop(name: str, colours: dict[str, str], graph_colors: str = "theme") -> Theme:
+    """Map btop's theme keys onto llmtop's styles.
+
+    btop has no colour for "running" or "asleep"; those take the text colour
+    and the label colour. "busy" takes the hot end of the temperature graph,
+    or the highlight colour where that is just the text colour again (orange).
+    With graph_colors = "default" the graphs keep llmtop's green-yellow-red
+    gradient inside the theme's frames and text.
+    """
+    def col(*keys: str, default: RGB | None = None) -> RGB | None:
+        for key in keys:
+            rgb = hex_to_rgb(colours.get(key, ""))
+            if rgb:
+                return rgb
+        return default
+
+    fg = col("main_fg", default=(200, 200, 200))
+    assert fg is not None
+    bg = col("main_bg")
+    inactive = col("inactive_fg") or mix(fg, bg or (0, 0, 0), 0.7)
+    hi = col("hi_fg") or fg
+    title = col("title") or fg
+    label = mix(fg, inactive, 0.35)
+    dim = mix(fg, inactive, 0.6)
+    if graph_colors == "default":
+        gradient = DEFAULT_GRADIENT
+        hot: Spec = DEFAULT_GRADIENT[-1]
+    else:
+        stops = [c for c in (col("cpu_start"), col("cpu_mid"), col("cpu_end")) if c]
+        gradient = gradient_specs(stops or [fg])
+        hot_rgb = col("temp_end", "cpu_end") or hi
+        if hot_rgb == fg:
+            hot_rgb = hi
+        hot = rgb_spec(hot_rgb)
+    frames = {key: col(key) or fg for key in ("cpu_box", "mem_box", "net_box", "proc_box")}
+    palette: dict[str, Spec] = {
+        "":           rgb_spec(fg),
+        "dim":        rgb_spec(dim, "dim"),
+        "label":      rgb_spec(label),
+        "hi":         rgb_spec(hi, "bold"),
+        "title":      rgb_spec(title, "bold"),
+        "clock":      rgb_spec(title, "bold"),
+        "ok":         rgb_spec(fg),
+        "idle":       rgb_spec(label),
+        "warn":       rgb_spec(hi),
+        "bad":        hot,
+        "lead":       (hot[0], hot[1], "bold"),
+        "model":      rgb_spec(col("proc_misc") or fg),
+        "track":      rgb_spec(col("div_line") or inactive, "dim"),
+        "b_system":   rgb_spec(frames["cpu_box"]),
+        "b_llama":    rgb_spec(frames["mem_box"]),
+        "b_endpoint": rgb_spec(frames["net_box"]),
+        "b_ollama":   rgb_spec(frames["proc_box"]),
+        "b_lemonade": rgb_spec(frames["cpu_box"]),
+        "b_bench":    rgb_spec(frames["mem_box"]),
+    }
+    return Theme(name, palette, gradient, rgb_to_256(bg) if bg else None)
+
+
+def theme_dirs() -> list[str]:
+    xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return [os.path.join(xdg, "llmtop", "themes"), os.path.join(xdg, "btop", "themes"),
+            "/usr/share/btop/themes", "/usr/local/share/btop/themes"]
+
+
+def list_themes() -> list[str]:
+    """default, the bundled ones, then every .theme file in the theme folders."""
+    names = ["default", *BUILTIN_THEMES]
+    for folder in theme_dirs():
         try:
-            idx = int(style[4:])
-        except ValueError:
-            return PALETTE[""]
-        frac = idx / (GRAD_N - 1)
-        return (GRADIENT[idx], "green" if frac < 0.45 else
-                "yellow" if frac < 0.8 else "red", "")
-    return PALETTE.get(style, PALETTE[""])
+            entries = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.endswith(".theme") and entry[:-6] not in names:
+                names.append(entry[:-6])
+    return names
 
 
-def parse_background(value) -> int | None:
-    """Config/CLI value -> xterm-256 index, or None for the terminal's own."""
+def find_theme_file(name: str) -> str | None:
+    if os.sep in name or name.endswith(".theme"):
+        path = os.path.expanduser(name)
+        return path if os.path.isfile(path) else None
+    for folder in theme_dirs():
+        path = os.path.join(folder, name + ".theme")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def load_theme(name: str | None, graph_colors: str = "theme") -> Theme:
+    """A theme by name or path; an unknown one falls back to the default."""
+    name = (name or "default").strip()
+    if name == "default":
+        return DEFAULT_THEME
+    colours = BUILTIN_THEMES.get(name)
+    if colours is None:
+        path = find_theme_file(name)
+        if path:
+            colours = read_btop_theme(path)
+    if not colours:
+        print(f"llmtop: unknown theme {name!r}, using default", file=sys.stderr)
+        return DEFAULT_THEME
+    label = os.path.basename(name)[:-6] if name.endswith(".theme") else name
+    return theme_from_btop(label, colours, graph_colors)
+
+
+THEME = DEFAULT_THEME
+
+
+def set_theme(theme: Theme) -> None:
+    """Colours are resolved through the current theme wherever a style name
+    meets a terminal, so switching it recolours the next frame."""
+    global THEME
+    THEME = theme
+
+
+def style_spec(style: str) -> Spec:
+    return THEME.spec(style)
+
+
+def parse_background(value) -> int | None | str:
+    """Config/CLI value -> xterm-256 index, None for the terminal's own, or
+    "theme" for whatever the theme says."""
     if value is None:
-        return DEFAULT_BACKGROUND
+        return "theme"
     if isinstance(value, int):
         return value if 0 <= value <= 255 else DEFAULT_BACKGROUND
     text = str(value).strip().lower()
     if text in ("", "none", "off", "false", "terminal", "default"):
         return None
+    if text == "theme":
+        return "theme"
     try:
         num = int(text)
     except ValueError:
         return DEFAULT_BACKGROUND
     return num if 0 <= num <= 255 else DEFAULT_BACKGROUND
+
+
+def resolve_background(value: int | None | str) -> int | None:
+    return THEME.background if value == "theme" else value  # type: ignore[return-value]
 
 
 # --------------------------------------------------------------------------
@@ -2568,7 +2821,7 @@ def build_pairs(curses, background: int | None) -> tuple[dict[str, int], int]:
              "red": curses.COLOR_RED, "cyan": curses.COLOR_CYAN,
              "blue": curses.COLOR_BLUE, "magenta": curses.COLOR_MAGENTA}
     plain = -1 if default_bg == -1 else curses.COLOR_WHITE
-    styles = [*PALETTE, *(f"grad{i}" for i in range(GRAD_N))]
+    styles = [*DEFAULT_PALETTE, *(f"grad{i}" for i in range(GRAD_N))]  # same keys in every theme
     for number, style in enumerate(styles, start=1):
         if number >= curses.COLOR_PAIRS:
             break
@@ -2583,13 +2836,438 @@ def build_pairs(curses, background: int | None) -> tuple[dict[str, int], int]:
     return pairs, pairs.get("", 0)
 
 
-def run_tui(collector: Collector, interval: float, ascii_mode: bool,
-            graph_height: str | int, background: int | None) -> int:
+# --------------------------------------------------------------------------
+# writing the configuration
+# --------------------------------------------------------------------------
+
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:g}" if value != int(value) else f"{value:.1f}"
+    if value is None:
+        return '"none"'
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k} = {toml_value(v)}" for k, v in value.items()
+                               if v is not None) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def split_comment(line: str) -> tuple[str, str]:
+    """(code, comment) of a TOML line - a # inside a string is not a comment."""
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i].rstrip(), line[i:]
+        i += 1
+    return line.rstrip(), ""
+
+
+def set_toml_key(text: str, section: str, key: str, value: str) -> str:
+    """Set one key in one section of a TOML text, touching only its line:
+    comments and other keys stay as they are. A missing key is appended to
+    the section, a missing section to the file. A value spanning lines (an
+    array) is replaced as a whole."""
+    lines = text.splitlines()
+    header = re.compile(r"^\s*\[\s*" + re.escape(section) + r"\s*\]\s*(#.*)?$")
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [f"[{section}]", f"{key} = {value}"]
+        return "\n".join(lines) + "\n"
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^\s*\[", lines[i])),
+               len(lines))
+    keyline = re.compile(r"^\s*" + re.escape(key) + r"\s*=")
+    for i in range(start + 1, end):
+        if not keyline.match(lines[i]):
+            continue
+        j = i
+        code, comment = split_comment(lines[j])
+        depth = code.count("[") - code.count("]")
+        while depth > 0 and j + 1 < end:
+            j += 1
+            code, comment = split_comment(lines[j])
+            depth += code.count("[") - code.count("]")
+        tail = ("   " + comment) if comment else ""
+        lines[i:j + 1] = [f"{key} = {value}{tail}"]
+        return "\n".join(lines) + "\n"
+    insert = end
+    while insert > start + 1 and not lines[insert - 1].strip():
+        insert -= 1
+    lines.insert(insert, f"{key} = {value}")
+    return "\n".join(lines) + "\n"
+
+
+UI_KEYS = ("theme", "graph_colors", "interval", "graph_height", "background", "ascii")
+
+
+def save_config(ui: dict, endpoints: list) -> str:
+    """Write the [ui] settings and [endpoints] urls into the config file the
+    menu was started with, line by line, after copying it to .bak. The result
+    must parse before it replaces the file."""
+    path = CONFIG_PATH or os.path.expanduser("~/.config/llmtop/config.toml")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        shutil.copy2(path, path + ".bak")
+    else:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        text = "# llmtop configuration, written from the menu (m); see config.toml.example\n"
+    for key in UI_KEYS:
+        value = ui[key]
+        if key == "graph_height" and str(value).isdigit():
+            value = int(value)
+        if key == "interval":
+            value = float(value)
+        text = set_toml_key(text, "ui", key, toml_value(value))
+    text = set_toml_key(text, "endpoints", "urls", toml_value(endpoints))
+    if tomllib is not None:
+        tomllib.loads(text)  # ValueError: nothing is written
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+# --------------------------------------------------------------------------
+# the menu
+# --------------------------------------------------------------------------
+
+LOGO = [
+    ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    ["███╗   ███╗", "████╗ ████║", "██╔████╔██║", "██║╚██╔╝██║", "██║ ╚═╝ ██║", "╚═╝     ╚═╝"],
+    ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+    [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
+]
+LOGO_ASCII = [
+    " _ _           _              ",
+    "| | |_ __ ___ | |_ ___  _ __  ",
+    "| | | '_ ` _ \\| __/ _ \\| '_ \\ ",
+    "| | | | | | | | || (_) | |_) |",
+    "|_|_|_| |_| |_|\\__\\___/| .__/ ",
+    "                       |_|    ",
+]
+
+
+def logo_rows(ascii_mode: bool) -> list[str]:
+    if ascii_mode:
+        return LOGO_ASCII
+    return ["".join(letter[i] for letter in LOGO) for i in range(6)]
+
+
+class Menu:
+    """btop's menu for llmtop: the logo, the few settings, and the endpoints.
+
+    Every change applies at once through `on_change`; `s` writes them to the
+    config file. Text is typed into a line at the bottom; while it is, no
+    other key does anything, so a URL can contain a q.
+    """
+
+    HELP = {
+        "theme": "default, orange, or any btop theme on this machine",
+        "graph_colors": "theme: the theme's gradient - default: green to red in the theme",
+        "interval": "seconds between measurements",
+        "graph_height": "auto fills the window - or 1 to 4 rows per graph",
+        "background": "theme, none for the terminal's own, or an xterm-256 colour",
+        "ascii": "plain ASCII instead of braille and box drawing",
+    }
+    BACKGROUNDS: list = ["theme", None, *range(232, 256), *range(16, 232), *range(0, 16)]
+    HEIGHTS = ["auto", 1, 2, 3, 4]
+
+    def __init__(self, ui: dict, endpoints: list, collector: Collector, on_change) -> None:
+        self.ui = ui
+        self.collector = collector
+        self.on_change = on_change
+        self.tab = 0  # 0 options, 1 endpoints
+        self.cursor = 0
+        self.ep_cursor = 0
+        self.endpoints: list[dict] = []
+        for entry in endpoints:
+            if isinstance(entry, dict):
+                if entry.get("url"):
+                    self.endpoints.append({"url": str(entry["url"]), "name": entry.get("name")})
+            elif str(entry):
+                self.endpoints.append({"url": str(entry), "name": None})
+        self.edit: dict | None = None  # {"field", "index", "buffer"}
+        self.tests: dict[str, str] = {}
+        self.message = ""
+        self.dirty = False
+        self.themes = list_themes()
+
+    # -- state ------------------------------------------------------------
+
+    def export(self) -> list:
+        return [{"url": e["url"], "name": e["name"]} if e.get("name") else e["url"]
+                for e in self.endpoints]
+
+    def _push_endpoints(self) -> None:
+        self.collector.cfg["endpoints"]["urls"] = self.export()
+        self.dirty = True
+        self.on_change("endpoints")
+
+    def _cycle(self, key: str, step: int) -> None:
+        ui = self.ui
+        if key == "theme":
+            names = self.themes
+            idx = names.index(ui["theme"]) if ui["theme"] in names else 0
+            ui["theme"] = names[(idx + step) % len(names)]
+        elif key == "graph_colors":
+            ui["graph_colors"] = "default" if ui["graph_colors"] == "theme" else "theme"
+        elif key == "interval":
+            ui["interval"] = max(0.5, min(60.0, float(ui["interval"]) + 0.5 * step))
+        elif key == "graph_height":
+            cur = ui["graph_height"]
+            cur = int(cur) if str(cur).isdigit() else "auto"
+            idx = self.HEIGHTS.index(cur) if cur in self.HEIGHTS else 0
+            ui["graph_height"] = self.HEIGHTS[(idx + step) % len(self.HEIGHTS)]
+        elif key == "background":
+            opts = self.BACKGROUNDS
+            idx = opts.index(ui["background"]) if ui["background"] in opts else 0
+            ui["background"] = opts[(idx + step) % len(opts)]
+        elif key == "ascii":
+            ui["ascii"] = not ui["ascii"]
+        self.dirty = True
+        self.on_change(key)
+
+    def test(self, index: int) -> None:
+        import threading
+        entry = self.endpoints[index]
+        url = entry["url"]
+        self.tests[url] = "testing …"
+
+        def run() -> None:
+            try:
+                be = self.collector._endpoint(url, entry.get("name"), set())
+            except Exception as exc:  # a bad URL must not take the display down
+                self.tests[url] = f"error: {exc}"
+                return
+            if be is None:
+                text = "shown in another panel"
+            elif be.state != RUNNING:
+                text = "unreachable"
+            else:
+                parts = [be.detail or "?", *be.extras[:1], be.model]
+                if be.ctx:
+                    parts.append(f"ctx {human_ctx(be.ctx)}")
+                text = " · ".join(p for p in parts if p and p != "-")
+            self.tests[url] = text
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def save(self) -> None:
+        try:
+            path = save_config(self.ui, self.export())
+        except (OSError, ValueError) as exc:
+            self.message = f"not saved: {exc}"
+            return
+        home = os.path.expanduser("~")
+        self.message = "saved " + (path.replace(home, "~", 1) if path.startswith(home) else path)
+        self.dirty = False
+
+    # -- keys -------------------------------------------------------------
+
+    def handle(self, key: int, ch: str, K) -> bool:
+        """One key. Returns False when the menu closes."""
+        if self.edit is not None:
+            return self._handle_edit(key, ch, K)
+        self.message = "" if key not in (-1,) else self.message
+        if key in (27, ord("m"), ord("M"), ord("q"), ord("Q")):
+            return False
+        if key == 9 or key == K.KEY_BTAB:
+            self.tab = 1 - self.tab
+            return True
+        if key in (ord("s"), ord("S")):
+            self.save()
+            return True
+        if self.tab == 0:
+            n = len(UI_KEYS)
+            if key == K.KEY_UP:
+                self.cursor = (self.cursor - 1) % n
+            elif key == K.KEY_DOWN:
+                self.cursor = (self.cursor + 1) % n
+            elif key in (K.KEY_RIGHT, 10, 13, K.KEY_ENTER, ord("l"), ord(" ")):
+                self._cycle(UI_KEYS[self.cursor], 1)
+            elif key in (K.KEY_LEFT, ord("h")):
+                self._cycle(UI_KEYS[self.cursor], -1)
+            return True
+        n = len(self.endpoints)
+        if key == K.KEY_UP and n:
+            self.ep_cursor = (self.ep_cursor - 1) % n
+        elif key == K.KEY_DOWN and n:
+            self.ep_cursor = (self.ep_cursor + 1) % n
+        elif key in (ord("a"), ord("A")):
+            self.edit = {"field": "url", "index": None, "buffer": "http://"}
+        elif key in (ord("u"), ord("U")) and n:
+            self.edit = {"field": "url", "index": self.ep_cursor,
+                         "buffer": self.endpoints[self.ep_cursor]["url"]}
+        elif key in (ord("n"), ord("N"), ord("e"), ord("E")) and n:
+            self.edit = {"field": "name", "index": self.ep_cursor,
+                         "buffer": self.endpoints[self.ep_cursor].get("name") or ""}
+        elif key in (ord("d"), ord("D"), K.KEY_DC) and n:
+            del self.endpoints[self.ep_cursor]
+            self.ep_cursor = max(0, min(self.ep_cursor, len(self.endpoints) - 1))
+            self._push_endpoints()
+        elif key in (10, 13, K.KEY_ENTER, ord("t"), ord("T")) and n:
+            self.test(self.ep_cursor)
+        return True
+
+    def _handle_edit(self, key: int, ch: str, K) -> bool:
+        edit = self.edit
+        assert edit is not None
+        if key == 27:
+            self.edit = None
+        elif key in (10, 13, K.KEY_ENTER):
+            value = edit["buffer"].strip()
+            self.edit = None
+            if edit["field"] == "url":
+                if not value or value == "http://":
+                    return True
+                if edit["index"] is None:
+                    self.endpoints.append({"url": value, "name": None})
+                    self.ep_cursor = len(self.endpoints) - 1
+                else:
+                    self.endpoints[edit["index"]]["url"] = value
+            else:
+                self.endpoints[edit["index"]]["name"] = value or None
+            self._push_endpoints()
+            self.test(self.ep_cursor)
+        elif key in (K.KEY_BACKSPACE, 127, 8):
+            edit["buffer"] = edit["buffer"][:-1]
+        elif key == 21:  # ctrl-u clears the line
+            edit["buffer"] = ""
+        elif ch and len(ch) == 1 and ch.isprintable():
+            edit["buffer"] += ch
+        return True
+
+    # -- drawing ----------------------------------------------------------
+
+    def _value(self, key: str) -> str:
+        v = self.ui[key]
+        if key == "background":
+            return "none" if v is None else str(v)
+        if key == "ascii":
+            return "on" if v else "off"
+        if key == "interval":
+            return f"{float(v):g} s"
+        return str(v)
+
+    def rows(self, width: int, height: int, renderer: Renderer) -> tuple[int, int, list[list[Seg]]]:
+        """(top row, left column, rows) of the overlay, every row the same width."""
+        box_w = max(40, min(72, width - 2))
+        inner = box_w - 4  # frame + one space each side
+        mid = renderer.mid
+        body: list[list[Seg]] = []
+
+        def line(segs: list[Seg], style_fill: str = "") -> None:
+            ln = Line(inner)
+            for text, style in segs:
+                if not ln.add_clipped(text, style):
+                    break
+            body.append(ln.padded())
+
+        logo = logo_rows(renderer.ascii)
+        if inner >= len(logo[0]) + 2 and height >= 26:
+            pad = (inner - len(logo[0])) // 2
+            for i, text in enumerate(logo):
+                line([(" " * pad, ""), (text, grad_style(1 - i / (len(logo) - 1)))])
+            line([])
+        tabs: list[Seg] = []
+        for i, name in enumerate(("Options", "Endpoints")):
+            active = i == self.tab
+            tabs += [("[ " if active else "  ", "hi" if active else "dim"),
+                     (name, "hi" if active else "label"),
+                     (" ]" if active else "  ", "hi" if active else "dim"), ("  ", "")]
+        tabs.append(("Tab switches", "dim"))
+        if self.dirty:
+            tabs.append((f"  {mid} unsaved", "warn"))
+        line(tabs)
+        line([])
+
+        if self.tab == 0:
+            for i, key in enumerate(UI_KEYS):
+                sel = i == self.cursor
+                arrow_l, arrow_r = ("<", ">") if renderer.ascii else ("◂", "▸")
+                line([("> " if sel else "  ", "hi"),
+                      (f"{key.replace('_', ' '):<14}", "hi" if sel else "label"),
+                      (f"{arrow_l} " if sel else "  ", "dim"),
+                      (self._value(key), "" if sel else "dim"),
+                      (f" {arrow_r}" if sel else "", "dim")])
+            line([])
+            line([("  " + self.HELP[UI_KEYS[self.cursor]], "dim")])
+            line([])
+            keys = [("Up/Dn" if renderer.ascii else "↑↓", " select  "),
+                    ("Lt/Rt" if renderer.ascii else "←→", " change  "),
+                    ("s", " save  "), ("Esc", " close")]
+        else:
+            if not self.endpoints:
+                line([("  no endpoints yet - press a to add one", "dim")])
+            for i, entry in enumerate(self.endpoints):
+                sel = i == self.ep_cursor
+                shown = entry.get("name") or ""
+                line([("> " if sel else "  ", "hi"),
+                      (f"{shown:<14}" if shown else " " * 14, "hi" if sel else "label"),
+                      (entry["url"], "" if sel else "dim")])
+                result = self.tests.get(entry["url"])
+                if result:
+                    line([("      ", ""), (result, "dim" if result == "testing …" else "ok")])
+            line([])
+            keys = [("a", " add  "), ("u", " url  "), ("n", " name  "), ("d", " delete  "),
+                    ("Enter", " test  "), ("s", " save  "), ("Esc", " close")]
+        if self.edit is not None:
+            cursor = "_" if renderer.ascii else "▏"
+            line([(f"  {self.edit['field']}: ", "label"), (self.edit["buffer"], "hi"),
+                  (cursor, "hi")])
+            line([("  Enter keeps it, Esc drops it", "dim")])
+        else:
+            segs: list[Seg] = [("  ", "")]
+            for k, word in keys:
+                segs += [(k, "hi"), (word, "label")]
+            line(segs)
+            if self.message:
+                line([("  " + self.message, "ok" if self.message.startswith("saved") else "bad")])
+
+        frame = "title"
+        tl, tr, bl, br = renderer.corners
+        h, v = renderer.h, renderer.v
+        title = f"{renderer.tab_top[0]}menu{renderer.tab_top[1]}"
+        top_line = tl + h * 2 + title + h * (box_w - 2 - 2 - len(title) - 1) + tr
+        rows: list[list[Seg]] = [[(top_line, frame)]]
+        for row in body:
+            rows.append([(v + " ", frame), *row, (" " + v, frame)])
+        rows.append([(bl + h * (box_w - 2) + br, frame)])
+        y0 = max(0, (height - len(rows)) // 2)
+        x0 = max(0, (width - box_w) // 2)
+        return y0, x0, rows
+
+
+# --------------------------------------------------------------------------
+# the TUI
+# --------------------------------------------------------------------------
+
+def run_tui(collector: Collector, ui: dict) -> int:
+    os.environ.setdefault("ESCDELAY", "25")  # Esc closes the menu without a pause
     import curses
     import select
     import threading
 
-    state: dict = {"snap": None, "err": None, "interval": interval, "stop": False,
+    state: dict = {"snap": None, "err": None, "interval": ui["interval"], "stop": False,
                    "force": threading.Event()}
 
     def worker() -> None:
@@ -2605,30 +3283,79 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool,
     def draw(stdscr) -> int:
         curses.curs_set(0)
         stdscr.nodelay(True)
-        pairs, base = build_pairs(curses, background)
+        stdscr.keypad(True)
+        pairs, base = build_pairs(curses, resolve_background(ui["background"]))
         stdscr.bkgd(" ", base)  # paints the background into every cell
-        renderer = Renderer(ascii_mode, graph_height)
+        renderer = Renderer(ui["ascii"], ui["graph_height"])
+        menu: Menu | None = None
         threading.Thread(target=worker, daemon=True).start()
+
+        def recolour() -> None:
+            nonlocal pairs, base
+            pairs, base = build_pairs(curses, resolve_background(ui["background"]))
+            stdscr.bkgd(" ", base)
+            stdscr.clear()
+
+        def on_change(key: str) -> None:
+            """A menu setting changed: apply it to the running display."""
+            if key in ("theme", "graph_colors"):
+                set_theme(load_theme(ui["theme"], ui["graph_colors"]))
+                recolour()
+            elif key == "background":
+                recolour()
+            elif key == "interval":
+                state["interval"] = ui["interval"]
+                state["force"].set()
+            elif key == "graph_height":
+                renderer.graph_height = ui["graph_height"]
+                stdscr.clear()
+            elif key == "ascii":
+                renderer.set_ascii(ui["ascii"])
+                stdscr.clear()
+            elif key == "endpoints":
+                state["force"].set()
+
+        def put(y: int, x: int, row: list[Seg], width: int) -> None:
+            for text, style in row:
+                if x >= width - 1:
+                    break
+                chunk = text[: max(0, width - 1 - x)]
+                try:
+                    stdscr.addnstr(y, x, chunk, width - 1 - x, pairs.get(style, base))
+                except curses.error:
+                    pass
+                x += len(chunk)
 
         while True:
             while True:  # drain every pending key
                 try:
-                    key = stdscr.getch()
+                    raw = stdscr.get_wch()
                 except curses.error:
-                    key = -1
-                if key == -1:
+                    raw = -1
+                if raw == -1:
                     break
+                ch = raw if isinstance(raw, str) else ""
+                key = ord(ch) if len(ch) == 1 else (raw if isinstance(raw, int) else -1)
                 if key == curses.KEY_RESIZE:
                     curses.update_lines_cols()
                     stdscr.clear()
-                elif key in (ord("q"), ord("Q"), 27):
+                    continue
+                if menu is not None:
+                    if not menu.handle(key, ch, curses):
+                        menu = None
+                        stdscr.clear()
+                    continue
+                if key in (ord("q"), ord("Q"), 27):
                     state["stop"] = True
                     state["force"].set()
                     return 0
+                elif key in (ord("m"), ord("M")):
+                    menu = Menu(ui, collector.cfg["endpoints"].get("urls") or [],
+                                collector, on_change)
                 elif key in (ord("+"), ord("=")):
-                    state["interval"] = min(60.0, state["interval"] + 0.5)
+                    ui["interval"] = state["interval"] = min(60.0, state["interval"] + 0.5)
                 elif key == ord("-"):
-                    state["interval"] = max(0.5, state["interval"] - 0.5)
+                    ui["interval"] = state["interval"] = max(0.5, state["interval"] - 0.5)
                 elif key in (ord("r"), ord("R"), ord(" ")):
                     state["force"].set()
 
@@ -2648,17 +3375,13 @@ def run_tui(collector: Collector, interval: float, ascii_mode: bool,
                 for y, row in enumerate(rows):
                     if y >= height - 1:
                         break
-                    x = 0
-                    for text, style in row:
-                        if x >= width - 1:
+                    put(y, 0, row, width)
+                if menu is not None:
+                    y0, x0, overlay = menu.rows(width - 1, height - 1, renderer)
+                    for i, row in enumerate(overlay):
+                        if y0 + i >= height - 1:
                             break
-                        chunk = text[: max(0, width - 1 - x)]
-                        try:
-                            stdscr.addnstr(y, x, chunk, width - 1 - x,
-                                           pairs.get(style, base))
-                        except curses.error:
-                            pass
-                        x += len(chunk)
+                        put(y0 + i, x0, row, width)
             if state["err"]:
                 try:
                     stdscr.addnstr(height - 1, 0, f"error: {state['err']}"[:width - 1],
@@ -2691,6 +3414,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--background", default=None,
                         help="xterm-256 background colour index, or 'none' "
                              f"for the terminal's own (default {DEFAULT_BACKGROUND})")
+    parser.add_argument("--theme", default=None,
+                        help="colour theme: default, orange, or a btop theme "
+                             "by name or path")
     parser.add_argument("--ascii", action="store_true",
                         help="ASCII only, no braille or box drawing")
     parser.add_argument("--no-color", action="store_true",
@@ -2705,6 +3431,9 @@ def main(argv: list[str] | None = None) -> int:
     graph_height = args.graph_height or cfg["ui"].get("graph_height", "auto")
     background = parse_background(args.background if args.background is not None
                                   else cfg["ui"].get("background"))
+    graph_colors = str(cfg["ui"].get("graph_colors") or "theme")
+    theme_name = args.theme or str(cfg["ui"].get("theme") or "default")
+    set_theme(load_theme(theme_name, graph_colors))
     collector = Collector(cfg)
 
     def sampled() -> Snapshot:
@@ -2724,14 +3453,16 @@ def main(argv: list[str] | None = None) -> int:
         # One-shot output is not bound by the window height.
         rows = Renderer(ascii_mode, graph_height if graph_height != "auto" else 1).rows(
             sampled(), width, 10_000, interval, False)
-        print_rows(rows, color, background, width)
+        print_rows(rows, color, resolve_background(background), width)
         return 0
 
     if not sys.stdout.isatty():
         print("llmtop: not a terminal, use --once or --json", file=sys.stderr)
         return 2
     try:
-        return run_tui(collector, interval, ascii_mode, graph_height, background)
+        ui = {"interval": interval, "ascii": ascii_mode, "graph_height": graph_height,
+              "background": background, "theme": THEME.name, "graph_colors": graph_colors}
+        return run_tui(collector, ui)
     except KeyboardInterrupt:
         return 0
 

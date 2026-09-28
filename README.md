@@ -36,7 +36,7 @@ Python 3.11+, no dependencies.
 │     SDXL-Turbo · sd-cpp/gpu · image                 │  21.3 MiB RSS  ctx   32k  slots     -  used 2h34 a… │
 │   ● Gemma-4-E4B… running  busy :8001                │ cpu  0.3 cores  gpu      -    44.5 tok/s ⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │     Gemma-4-E4B-it-GGUF · llamacpp/gpu              │ 938.2 MiB RSS  ctx  128k  slots   2/4               │
-╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.7.0 · every 1s└─╯
+╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.8.0 · every 1s└─╯
 ```
 
 ## Why not just extend btop
@@ -118,7 +118,7 @@ the key bindings.
 |---|---|
 | llama.cpp: state, model, context | `systemctl show` on service and socket, start script |
 | llama.cpp: slots, tok/s | `GET /slots` on the internal port, delta of `n_decoded` |
-| Endpoints (`[endpoints] urls`) | `GET /v1/models`; `/slots` if it has one, else `/metrics`: busy from `requests_processing`, tok/s from `tokens_predicted_total` ÷ `tokens_predicted_seconds_total` of finished requests |
+| Endpoints (`[endpoints] urls`) | name: host in the URL, reverse lookup of an address, or the configured `name`; engine: `owned_by` in `GET /v1/models`, confirmed once by `/props`, `/api/version`, `/version` or `/api/v1/health`; model: `/v1/models`, for Ollama `/api/ps`, for Lemonade `/api/v1/health`; `/slots` if it has one, else `/metrics`: busy from `requests_processing`, tok/s from `tokens_predicted_total` ÷ `tokens_predicted_seconds_total` of finished requests |
 | Ollama: model, memory, unload timer | `GET /api/ps` (`size_vram`, `context_length`, `expires_at`) |
 | Ollama: model ↔ runner process | manifests under `models/manifests`, blob digest of the model layer |
 | Lemonade: models, backends, idle time | `GET /api/v1/health`, `last_use` against `/proc/uptime` |
@@ -149,10 +149,17 @@ written when a task finishes and stands still during generation. `/slots` counts
 along live.
 
 A server that is neither a `llama-*` unit nor a `llama-server` process — one in a
-container, on another host, or an engine with its own binary name that speaks
-llama.cpp's HTTP API — can be listed under `[endpoints] urls`. Such servers get their own **Endpoints**
-panel, since llmtop cannot tell which program answers. They are measured
-over HTTP only, so it shows no process CPU, memory or GPU figures. Without
+container, on another host, or an engine with its own binary name — can be listed
+under `[endpoints] urls`, as a URL or as `{url = "…", name = "…"}`. Such servers get
+their own **Endpoints** panel and are measured over HTTP only, so it shows no process
+CPU, memory or GPU figures. The row is named after the host (`ai395:8090`: the name
+in the URL, a reverse lookup of the address, or the configured `name`), and the detail
+field says which program answers — llama.cpp, Ollama, vLLM, LM Studio or Lemonade,
+told apart by `owned_by` in `/v1/models` and confirmed by a version probe (`/props`,
+`/api/version`, `/version`, `/api/v1/health`) once per server; the version goes on the
+line below. An Ollama or Lemonade endpoint shows the model it has **loaded** (from
+`/api/ps` or `/api/v1/health`), not the first of its library; a local Ollama already
+shown in its own panel is skipped. Without
 `/slots`, its tok/s is the speed of the **last finished request**, taken from the
 two `/metrics` counters rather than as a rate over wall time (which would jump
 when a request ends and fall back to zero). It is shown as tok/s only while the

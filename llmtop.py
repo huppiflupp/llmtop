@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import ipaddress
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -36,7 +38,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -63,6 +65,21 @@ def read_int(path: str | Path) -> int | None:
         return int(raw.split()[0])
     except (ValueError, IndexError):
         return None
+
+
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+# What /v1/models says in owned_by, per engine. Anything else is shown verbatim.
+ENGINE_BY_OWNER = {"llamacpp": "llama.cpp", "library": "Ollama", "vllm": "vLLM",
+                   "organization_owner": "LM Studio", "lemonade": "Lemonade"}
+
+
+def is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
 
 
 def http_json(url: str, timeout: float = HTTP_TIMEOUT):
@@ -798,6 +815,8 @@ class Collector:
         self.gputime = GpuTimeTracker()
         self.rates = RateTracker()
         self.finished = FinishedRate()
+        self._rdns: dict[str, str] = {}  # address -> name, one lookup per host
+        self._engines: dict[str, tuple[str, str | None]] = {}  # base url -> (engine, version)
         self.guarded_ports: set[int] = set()
         self._npu_name: str | None = None
         self._npu_probed = False
@@ -829,12 +848,13 @@ class Collector:
                 break
         return self.rates.rate(key, total)
 
-    def _llama_live(self, be: Backend, host: str, port: int, use_metrics: bool) -> None:
+    def _llama_live(self, be: Backend, host: str, port: int, use_metrics: bool,
+                    scheme: str = "http") -> None:
         """Measure a running backend. Internal ports only, never sockets."""
         if port in self.guarded_ports:
             be.extras.append("skipped measurement (socket port)")
             return
-        base = f"http://{host}:{port}"
+        base = f"{scheme}://{host}:{port}"
         slots = http_json(f"{base}/slots")
         if isinstance(slots, list):
             be.slots_total = len(slots)
@@ -948,44 +968,168 @@ class Collector:
     def collect_endpoints(self, llama: list[Backend]) -> list[Backend]:
         """Servers named in [endpoints] urls: found neither as a unit nor as a
         process (a container, another host, an engine with its own binary name)
-        but speaking llama.cpp's HTTP API."""
+        but speaking the OpenAI-style HTTP API of llama.cpp, Ollama, vLLM and
+        friends. Each entry is a URL or {url = ..., name = ...}."""
         seen = {be.port for be in llama if be.port}
+        m = re.search(r"://([^:/]+):(\d+)", self.cfg["ollama"]["url"])
+        if m and m.group(1) in LOCAL_HOSTS:
+            seen.add(int(m.group(2)))  # the Ollama panel already shows that one
         backends: list[Backend] = []
-        for url in self.cfg["endpoints"].get("urls") or []:
-            be = self._llama_endpoint(str(url), seen)
+        for entry in self.cfg["endpoints"].get("urls") or []:
+            if isinstance(entry, dict):
+                url, name = str(entry.get("url") or ""), entry.get("name")
+            else:
+                url, name = str(entry), None
+            if not url:
+                continue
+            be = self._endpoint(url, str(name) if name else None, seen)
             if be:
                 backends.append(be)
         return backends
 
-    def _llama_endpoint(self, url: str, seen_ports: set[int]) -> Backend | None:
-        """A llama.cpp-compatible server named in the config, measured over HTTP only."""
+    def _endpoint_name(self, host: str, port: int, name: str | None) -> str:
+        """The row's name: the configured one, else the host's short name and
+        the port (ai395:8090). An address is resolved once and the result
+        kept, hit or miss, so a slow resolver costs one scrape, not every one."""
+        if name:
+            return name
+        label = host
+        if is_ip(host):
+            if host not in self._rdns:
+                try:
+                    self._rdns[host] = socket.gethostbyaddr(host)[0]
+                except OSError:
+                    self._rdns[host] = host
+            label = self._rdns[host]
+        if label in LOCAL_HOSTS:
+            label = "localhost"
+        elif not is_ip(label):
+            label = label.split(".")[0]  # ai395.fritz.box -> ai395
+        return f"{label}:{port}"
+
+    def _engine_of(self, base: str, owner: str | None) -> tuple[str, str | None]:
+        """Which program answers at `base`, and its version.
+
+        owned_by in /v1/models names the engine for the ones we know; a version
+        probe confirms it. An unknown or missing owner gets every probe. Probed
+        once per server and cached: the answer cannot change while it runs.
+        """
+        cached = self._engines.get(base)
+        if cached is not None:
+            return cached
+        engine = ENGINE_BY_OWNER.get(owner or "", owner or "")
+        known = engine in ENGINE_BY_OWNER.values()
+        version = None
+        if engine == "llama.cpp" or not known:
+            # llama.cpp and the engines built on it answer /props with a build id
+            props = http_json(f"{base}/props")
+            if isinstance(props, dict) and props.get("build_info"):
+                version = str(props["build_info"]).split("-")[0]
+                engine = engine or "llama.cpp"
+        if engine == "Ollama" or not known:
+            ver = http_json(f"{base}/api/version")
+            if isinstance(ver, dict) and ver.get("version"):
+                engine, version = "Ollama", f"v{ver['version']}"
+        if engine == "vLLM" or not known:
+            ver = http_json(f"{base}/version")
+            if isinstance(ver, dict) and ver.get("version"):
+                engine, version = "vLLM", f"v{ver['version']}"
+        if engine == "Lemonade" or not known:
+            health = http_json(f"{base}/api/v1/health")
+            if isinstance(health, dict) and health.get("version"):
+                engine, version = "Lemonade", f"v{health['version']}"
+        self._engines[base] = (engine, version)
+        return engine, version
+
+    def _endpoint(self, url: str, name: str | None, seen_ports: set[int]) -> Backend | None:
+        """A server named in the config, measured over HTTP only."""
         parts = urllib.parse.urlsplit(url if "://" in url else f"http://{url}")
         host = parts.hostname or "127.0.0.1"
         port = parts.port or (443 if parts.scheme == "https" else 80)
-        if host in ("127.0.0.1", "localhost", "::1") and port in seen_ports:
-            return None  # already shown as a unit or a process
-        base = f"{parts.scheme or 'http'}://{host}:{port}"
-        be = Backend(kind="endpoint", name=f"{host}:{port}", detail="http", port=port)
+        if host in LOCAL_HOSTS and port in seen_ports:
+            return None  # already shown as a unit, a process or the Ollama panel
+        scheme = parts.scheme or "http"
+        base = f"{scheme}://{host}:{port}"
+        be = Backend(kind="endpoint", name=self._endpoint_name(host, port, name), port=port)
         models = http_json(f"{base}/v1/models")
         if not isinstance(models, dict):
             be.state = STOPPED
             be.extras.append("unreachable")
+            self._engines.pop(base, None)  # probe again once it is back
             return be
         be.state = RUNNING
         data = models.get("data") or []
         first = data[0] if data and isinstance(data[0], dict) else {}
+        engine, version = self._engine_of(base, first.get("owned_by"))
+        be.detail = engine
+        if version:
+            be.extras.append(version)
+        if engine == "Ollama":
+            self._ollama_endpoint(be, base)
+            return be
+        if engine == "Lemonade":
+            self._lemonade_endpoint(be, base)
+            return be
         be.model = model_label(None, first.get("id")) if first.get("id") else "-"
-        owner = first.get("owned_by")
-        if owner and owner != "llamacpp":
-            be.name = f"{owner}:{port}"
         meta = first.get("meta") if isinstance(first.get("meta"), dict) else {}
         be.ctx = meta.get("n_ctx") or first.get("max_model_len") or first.get("context_length")
         slots = http_json(f"{base}/slots")
         if isinstance(slots, list):
-            self._llama_live(be, host, port, True)
+            self._llama_live(be, host, port, True, scheme)
         else:
             self._metrics_live(be, base)
         return be
+
+    def _ollama_endpoint(self, be: Backend, base: str) -> None:
+        """An Ollama reached over HTTP. /v1/models lists its whole library; the
+        model it has loaded is in /api/ps, as in the Ollama panel, minus the
+        runner process."""
+        ps = http_json(f"{base}/api/ps")
+        models = ps.get("models") if isinstance(ps, dict) else None
+        if not models:
+            be.model = "-"
+            be.extras.append("no model loaded")
+            return
+        now = time.time()
+        children = [self._ollama_model(entry, now) for entry in models]
+        if len(children) == 1:
+            first = children[0]
+            be.model, be.ctx, be.mem, be.mem_kind = first.model, first.ctx, first.mem, first.mem_kind
+            be.idle_in = first.idle_in
+            be.extras.extend(first.extras)
+        else:
+            be.model = f"{len(children)} models"
+            be.mem = sum(c.mem or 0 for c in children) or None
+            be.mem_kind = "GPU"
+            be.children = children
+
+    def _lemonade_endpoint(self, be: Backend, base: str) -> None:
+        """A Lemonade reached over HTTP: the loaded models are in /api/v1/health."""
+        health = http_json(f"{base}/api/v1/health")
+        loaded = health.get("all_models_loaded") if isinstance(health, dict) else None
+        if not loaded:
+            be.model = "-"
+            be.extras.append("no model loaded")
+            return
+        children: list[Backend] = []
+        for entry in loaded:
+            child = Backend(kind="lemonade-model", state=RUNNING,
+                            name=entry.get("model_name", "?"),
+                            model=entry.get("model_name", "?"),
+                            ctx=(entry.get("recipe_options") or {}).get("ctx_size"))
+            child.busy = bool(entry.get("is_busy") or entry.get("is_streaming"))
+            recipe, device = entry.get("recipe"), entry.get("device")
+            if recipe:
+                child.extras.append(f"{recipe}/{device}" if device else str(recipe))
+            children.append(child)
+        if len(children) == 1:
+            first = children[0]
+            be.model, be.ctx, be.busy = first.model, first.ctx, first.busy
+            be.extras.extend(first.extras)
+        else:
+            be.model = f"{len(children)} models"
+            be.busy = any(c.busy for c in children)
+            be.children = children
 
     def _metrics_live(self, be: Backend, base: str) -> None:
         """Busy and speed from /metrics alone, for servers without /slots."""
@@ -1235,27 +1379,7 @@ class Collector:
         blobs = self._ollama_blob_map() if runners else {}
         now = time.time()
         for entry in models:
-            full = entry.get("name", "?")
-            child = Backend(kind="ollama-model", name=full.rsplit("/", 1)[-1],
-                            state=RUNNING, model=full,
-                            ctx=entry.get("context_length"))
-            vram = entry.get("size_vram") or 0
-            total = entry.get("size") or 0
-            child.mem = total or None
-            child.mem_kind = "GPU" if vram >= total > 0 else ("part GPU" if vram else "RAM")
-            if 0 < vram < total:
-                child.extras.append(f"{vram/total*100:.0f}% GPU")
-            details = entry.get("details") or {}
-            if details.get("parameter_size"):
-                child.extras.append(details["parameter_size"])
-            if details.get("quantization_level"):
-                child.extras.append(details["quantization_level"])
-            expires = parse_iso(entry.get("expires_at"))
-            # While a request runs Ollama reports a zero time (year 1); that
-            # is "not scheduled", not "already unloaded".
-            if expires and expires > 946684800:
-                child.idle_in = expires - now
-
+            child = self._ollama_model(entry, now)
             runner = self._match_runner(entry, runners, blobs)
             if runner is not None:
                 child.pid = runner.pid
@@ -1283,6 +1407,31 @@ class Collector:
             be.mem_kind = "GPU"
             be.gpu_mem = sum(c.gpu_mem or 0 for c in be.children) or None
         return be, pids
+
+    @staticmethod
+    def _ollama_model(entry: dict, now: float) -> Backend:
+        """A loaded model as /api/ps reports it, before its runner is attached."""
+        full = entry.get("name", "?")
+        child = Backend(kind="ollama-model", name=full.rsplit("/", 1)[-1],
+                        state=RUNNING, model=full,
+                        ctx=entry.get("context_length"))
+        vram = entry.get("size_vram") or 0
+        total = entry.get("size") or 0
+        child.mem = total or None
+        child.mem_kind = "GPU" if vram >= total > 0 else ("part GPU" if vram else "RAM")
+        if 0 < vram < total:
+            child.extras.append(f"{vram/total*100:.0f}% GPU")
+        details = entry.get("details") or {}
+        if details.get("parameter_size"):
+            child.extras.append(details["parameter_size"])
+        if details.get("quantization_level"):
+            child.extras.append(details["quantization_level"])
+        expires = parse_iso(entry.get("expires_at"))
+        # While a request runs Ollama reports a zero time (year 1); that
+        # is "not scheduled", not "already unloaded".
+        if expires and expires > 946684800:
+            child.idle_in = expires - now
+        return child
 
     @staticmethod
     def _match_runner(entry: dict, runners: list[ProcInfo],

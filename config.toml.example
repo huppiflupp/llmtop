@@ -12,13 +12,14 @@ unit_glob_socket = "llama-*.socket"
 unit_glob_service = "llama-*.service"
 
 [endpoints]
-# Servers that speak llama.cpp's HTTP API but that llmtop cannot find as a unit or a
-# process: one in a container, on another host, or an engine with its own binary
-# name. They get their own "Endpoints" panel. Measured over HTTP only (/v1/models,
-# /slots or else /metrics), so no process CPU, memory or GPU figures. Without /slots,
-# tok/s is the speed of the last finished request, shown while the server is
-# busy; when idle it shows 0.0 and the figure moves to the line below.
-urls = []   # e.g. ["http://127.0.0.1:8092"]
+# Servers llmtop cannot find as a unit or a process: one in a container, on another
+# host, or an engine with its own binary name (llama.cpp, Ollama, vLLM, LM Studio,
+# Lemonade). They get their own "Endpoints" panel, named after the host (or the
+# given name) and saying which program answers. Measured over HTTP only, so no
+# process CPU, memory or GPU figures. Without /slots, tok/s is the speed of the
+# last finished request, shown while the server is busy; when idle it shows 0.0
+# and the figure moves to the line below.
+urls = []   # e.g. ["http://ai395:8090", {url = "http://192.168.178.54:8091", name = "strix-30b"}]
 
 [ollama]
 url = "http://127.0.0.1:11434"

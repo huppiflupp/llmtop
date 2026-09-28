@@ -8,6 +8,8 @@ Drawn like btop: framed panels with titles set into the border, braille history
 graphs with a colour gradient, a clock, and a background of its own. One file,
 Python 3.11+, no dependencies.
 
+![llmtop with the orange theme and the default graph colours, a llama-server busy at 156 tok/s](docs/screenshot.png)
+
 ```
 ╭─┐tower · GMKtec NucBox EVO-X2┌─────────────────┐11:19:05┌──────────────────────────────────────┐up 1d18h┌─╮
 │      AMD RYZEN AI MAX+ 395 w/ Radeon 8060S · 32 th… │      Radeon 8060S · 2737Mhz                         │
@@ -103,6 +105,8 @@ tests the selected one right away: the line below shows what answers there
 (`llama.cpp · b392 · qwen3.6-35b-a3b · ctx 256k`) or `unreachable`. New
 endpoints appear in the Endpoints panel immediately. `s` writes everything to
 the config file, `Esc` closes the menu.
+
+![The menu over the panels](docs/menu.png)
 
 Saving edits the file line by line: only the keys the menu knows are touched,
 comments and other sections stay, and the previous file is kept as

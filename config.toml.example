@@ -36,8 +36,9 @@ url = "http://127.0.0.1:8000"
 unit = "lemond.service"
 
 [bench]
-# Programs listed in the "benchmarks" panel: matched by program name only, never
-# by command line (earlyoom names llama-server in its own arguments).
+# Programs listed in the "benchmarks" panel: matched by program name, or by a
+# folder of that name in the executable's path (colibri-27b/c/qwen36 is a colibri
+# run), never by command line (earlyoom names llama-server in its own arguments).
 programs = ["llama-bench", "llama-perplexity", "llama-batched-bench", "llama-cli",
             "colibri", "xdna_energy_bench", "cpu_stream", "gpu_bw", "gpu_import"]
 

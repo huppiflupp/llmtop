@@ -36,7 +36,7 @@ Python 3.11+, no dependencies.
 │     SDXL-Turbo · sd-cpp/gpu · image                 │  21.3 MiB RSS  ctx   32k  slots     -  used 2h34 a… │
 │   ● Gemma-4-E4B… running  busy :8001                │ cpu  0.3 cores  gpu      -    44.5 tok/s ⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │     Gemma-4-E4B-it-GGUF · llamacpp/gpu              │ 938.2 MiB RSS  ctx  128k  slots   2/4               │
-╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.8.0 · every 1s└─╯
+╰─┘q quit  +/- interval  r refresh└───────────────────┴───────────────────────────┘llmtop 0.8.1 · every 1s└─╯
 ```
 
 ## Why not just extend btop
@@ -132,7 +132,10 @@ the key bindings.
 Programs that load the machine without serving an API, such as `llama-bench`,
 `llama-perplexity` or a `colibri` run, get their own **benchmarks** panel. They
 have no tok/s to read, but without the panel their load showed up with no
-source at all. The list of program names is configurable (`[bench]`).
+source at all. The list of program names is configurable (`[bench]`). A binary
+of another name inside a folder of a listed name counts too, so a colibri run
+built per model (`~/src/colibri-27b/c/qwen36`) is still a `colibri` row, with
+its command line on the line below.
 
 Process CPU is given in cores (1.0 = one full core), so it cannot be mistaken
 for the whole-machine CPU graph above it. The device a backend actually runs on

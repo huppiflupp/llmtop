@@ -38,7 +38,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -1304,14 +1304,26 @@ class Collector:
         pattern = re.compile("^(" + "|".join(re.escape(n) for n in names) + ")$")
         procs = proc_all()
         found = proc_scan(pattern, procs)
-        pids = {p.pid for p in found}
+        # A binary of another name inside a folder of the program's name is a
+        # run of that program too: colibri builds its kernels per model, so a
+        # run is ~/src/colibri-27b/c/qwen36, and never called "colibri".
+        matched = {p.pid: os.path.basename(p.argv[0]) if p.argv else p.comm for p in found}
+        for proc in procs:
+            if proc.pid in matched:
+                continue
+            hit = self._bench_by_path(proc, names)
+            if hit:
+                found.append(proc)
+                matched[proc.pid] = hit
+        pids = set(matched)
         out = []
         for proc in found:
             # A re-exec'd or forked worker of a program already listed is the
             # same run (colibri re-execs itself once for OpenMP tuning).
             if proc.ppid in pids or proc.pid in owned_pids or proc.ppid in owned_pids:
                 continue
-            prog = os.path.basename(proc.argv[0]) if proc.argv else proc.comm
+            prog = matched[proc.pid]
+            binary = os.path.basename(proc.argv[0]) if proc.argv else proc.comm
             cfg = parse_llama_argv(proc.argv)
             model = cfg.get("model")
             if not model and prog == "colibri":
@@ -1319,10 +1331,33 @@ class Collector:
             be = Backend(kind="bench", name=prog, state=RUNNING,
                          detail="no API", pid=proc.pid, model=model_label(model),
                          mem=proc.rss, mem_kind="RSS", since=self._proc_age(proc.pid))
+            if binary != prog:
+                # the command line says what the run is: "qwen36 256 4 pp.txt"
+                be.extras.append(" ".join([binary, *proc.argv[1:]])[:60])
             be.cpu = self.cpu.percent(proc.pid, proc.cpu_ticks)
             self._attach_gpu(be)
             out.append(be)
         return out
+
+    @staticmethod
+    def _bench_by_path(proc: ProcInfo, names: list[str]) -> str | None:
+        """The bench program whose name a folder of the executable's path
+        starts with (colibri-27b), or None. Shells and interpreters do not
+        count, whatever folder they run from."""
+        if not proc.argv or proc.comm in ("bash", "sh", "zsh", "tee", "python3", "python", "sudo"):
+            return None
+        path = proc.argv[0]
+        if "/" not in path:
+            try:
+                path = os.readlink(f"/proc/{proc.pid}/exe")
+            except OSError:
+                return None
+        folders = path.split("/")[:-1]
+        for name in names:
+            if any(f == name or f.startswith(name + "-") or f.startswith(name + "_")
+                   for f in folders):
+                return name
+        return None
 
     def collect_ollama(self) -> tuple[Backend, set[int]]:
         host = self.cfg["ollama"]["url"].rstrip("/")

@@ -162,7 +162,7 @@ the key bindings.
 | Lemonade: throughput | `GET /api/v1/stats`, else `/slots` of the matching llama.cpp |
 | Memory per process | `/proc/<pid>/fdinfo`, `drm-resident-gtt` + `drm-resident-vram` |
 | GPU time per process | `/proc/<pid>/fdinfo`, delta of `drm-engine-*` |
-| GPU overall | `/sys/class/drm/card*/device`, else `nvidia-smi` |
+| GPU overall | `/sys/class/drm/card*/device` and `nvidia-smi`; with several cards the one running compute processes wins, then a discrete card over an integrated one (hybrid laptops: the NVIDIA card, not the iGPU driving the display) |
 | NPU | `/sys/class/accel/*`, `xrt-smi examine`, open `/dev/accel/*` handles |
 | Benchmarks and measurement runs | processes by program name (`llama-bench`, `llama-perplexity`, `colibri`, …), `/proc/<pid>` and its `fdinfo` |
 

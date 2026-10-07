@@ -38,7 +38,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
+# An amdgpu card with at least this much VRAM of its own counts as discrete.
+AMD_DISCRETE_VRAM = 2 << 30
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -1609,6 +1611,24 @@ class Collector:
     # -- GPU ---------------------------------------------------------------
 
     def collect_gpu(self) -> dict:
+        """The GPU worth showing. Hybrid laptops have an integrated AMD GPU that
+        drives the display next to a discrete NVIDIA card that runs the model;
+        the first amdgpu card is then the wrong one. Every card is collected and
+        ranked: one with compute processes on it (a loaded model) first, then a
+        discrete card before an integrated one, then the larger memory."""
+        cards = self._amd_gpus() + self._nvidia_gpus()
+        if not cards:
+            return {}
+        best = max(cards, key=lambda g: (g.pop("_compute", False),
+                                         g.pop("_discrete", False),
+                                         g.get("vram_total") or 0))
+        for g in cards:
+            g.pop("_compute", None)
+            g.pop("_discrete", None)
+        return best
+
+    def _amd_gpus(self) -> list[dict]:
+        out = []
         for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
             dev = card / "device"
             if not (dev / "mem_info_gtt_used").exists():
@@ -1626,6 +1646,9 @@ class Collector:
                          "gtt_used": read_int(dev / "mem_info_gtt_used"),
                          "gtt_total": read_int(dev / "mem_info_gtt_total"),
                          "card": card.name}
+            # An APU has a small carve-out (or none) and lives on its GTT; a
+            # discrete card brings gigabytes of its own VRAM.
+            gpu["_discrete"] = (gpu["vram_total"] or 0) >= AMD_DISCRETE_VRAM
             sclk = read_text(dev / "pp_dpm_sclk") or ""
             current = [ln for ln in sclk.splitlines() if ln.endswith("*")]
             if current:
@@ -1637,28 +1660,43 @@ class Collector:
                 temp = read_int(hwmon / "temp1_input")
                 if temp:
                     gpu["temp"] = temp / 1000.0
-            return gpu
-        if shutil.which("nvidia-smi"):
+            out.append(gpu)
+        return out
+
+    def _nvidia_gpus(self) -> list[dict]:
+        if not shutil.which("nvidia-smi"):
+            return []
+
+        def smi(*args: str) -> str:
             try:
-                out = subprocess.run(
-                    ["nvidia-smi",
-                     "--query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
-                     "--format=csv,noheader,nounits"],
+                return subprocess.run(
+                    ["nvidia-smi", *args, "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=4,
                     stdin=subprocess.DEVNULL).stdout.strip()
             except (subprocess.SubprocessError, OSError):
-                return {}
-            if out:
-                f = [x.strip() for x in out.splitlines()[0].split(",")]
+                return ""
 
-                def num(idx, scale=1.0):
-                    try:
-                        return float(f[idx]) * scale
-                    except (ValueError, IndexError):
-                        return None
-                return {"name": f[0], "busy": num(1), "vram_used": num(2, 1 << 20),
-                        "vram_total": num(3, 1 << 20), "watt": num(4), "temp": num(5)}
-        return {}
+        out = smi("--query-gpu=uuid,name,utilization.gpu,memory.used,memory.total,"
+                  "power.draw,temperature.gpu")
+        if not out:
+            return []
+        busy_uuids = {ln.split(",")[0].strip()
+                      for ln in smi("--query-compute-apps=gpu_uuid,pid").splitlines()
+                      if ln.strip()}
+        cards = []
+        for n, line in enumerate(out.splitlines()):
+            f = [x.strip() for x in line.split(",")]
+
+            def num(idx, scale=1.0):
+                try:
+                    return float(f[idx]) * scale
+                except (ValueError, IndexError):
+                    return None
+            cards.append({"name": f[1], "busy": num(2), "vram_used": num(3, 1 << 20),
+                          "vram_total": num(4, 1 << 20), "watt": num(5), "temp": num(6),
+                          "card": f"nvidia{n}",
+                          "_compute": f[0] in busy_uuids, "_discrete": True})
+        return cards
 
     # -- NPU ---------------------------------------------------------------
 

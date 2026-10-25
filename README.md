@@ -79,6 +79,20 @@ install -m 755 llmtop/llmtop.py ~/.local/bin/llmtop
 llmtop
 ```
 
+On macOS (Apple Silicon) it runs too, with Python >= 3.11 from Homebrew - the
+system's `python3` is 3.9, so point the shebang at it:
+
+```bash
+brew install python@3.14
+sed '1s|.*|#!/opt/homebrew/bin/python3.14|' llmtop/llmtop.py > ~/.local/bin/llmtop
+chmod 755 ~/.local/bin/llmtop
+```
+
+There, processes come from `ps`, memory from `vm_stat`, and the GPU from the
+IOAccelerator entry in `ioreg` (utilisation and the RAM it holds, against
+`iogpu.wired_limit_mb`). No root needed. Per-process GPU figures and the NPU
+are not available.
+
 ## Usage
 
 ```

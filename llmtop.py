@@ -272,7 +272,7 @@ def mem_pct(used: float | None, total: float | None) -> float | None:
 def gpu_mem(gpu: dict) -> tuple[str, float | None, float | None]:
     """The GPU's memory pool: GTT on unified memory, VRAM otherwise."""
     if gpu.get("gtt_total"):
-        return "GTT", gpu.get("gtt_used"), gpu["gtt_total"]
+        return gpu.get("pool", "GTT"), gpu.get("gtt_used"), gpu["gtt_total"]
     return "VRAM", gpu.get("vram_used"), gpu.get("vram_total")
 
 
@@ -316,6 +316,8 @@ class ProcInfo:
 
 
 def proc_read(pid: int) -> ProcInfo | None:
+    if IS_DARWIN:
+        return next(iter(darwin_procs(pid)), None)
     base = f"/proc/{pid}"
     raw = read_text(f"{base}/stat")
     if raw is None:
@@ -340,6 +342,8 @@ def proc_read(pid: int) -> ProcInfo | None:
 
 
 def proc_all() -> list[ProcInfo]:
+    if IS_DARWIN:
+        return darwin_procs()
     procs = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -366,6 +370,91 @@ def proc_scan(pattern: re.Pattern[str],
         if any(pattern.search(n) for n in names):
             found.append(info)
     return found
+
+
+# --------------------------------------------------------------------------
+# macOS: no /proc and no /sys, so ps, sysctl, vm_stat and ioreg stand in
+# --------------------------------------------------------------------------
+
+IS_DARWIN = sys.platform == "darwin"
+
+
+def run_text(argv: list[str], timeout: float = 5) -> str:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL).stdout
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def sysctl(name: str) -> str | None:
+    value = run_text(["/usr/sbin/sysctl", "-n", name]).strip()
+    return value or None
+
+
+def ps_seconds(text: str) -> float | None:
+    """ps durations: "1:02.50" (cputime) or "3-04:05:06" (etime)."""
+    days, _, rest = text.strip().rpartition("-")
+    try:
+        total = 0.0
+        for part in rest.split(":"):
+            total = total * 60 + float(part)
+        return total + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
+def darwin_procs(pid: int | None = None) -> list["ProcInfo"]:
+    """All processes (or one) from two ps calls: the full command line, and
+    the executable path, which may contain spaces and must come last."""
+    sel = ["-p", str(pid)] if pid is not None else ["-ax"]
+    comms = {}
+    for line in run_text(["/bin/ps", *sel, "-o", "pid=,comm="]).splitlines():
+        p, _, comm = line.strip().partition(" ")
+        if p.isdigit():
+            comms[int(p)] = os.path.basename(comm.strip())
+    procs = []
+    for line in run_text(["/bin/ps", *sel, "-ww", "-o",
+                          "pid=,ppid=,rss=,time=,args="]).splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4 or not parts[0].isdigit():
+            continue
+        p = int(parts[0])
+        cpu = ps_seconds(parts[3]) or 0.0
+        argv = parts[4].split() if len(parts) > 4 else []
+        procs.append(ProcInfo(p, int(parts[1]), comms.get(p, ""), argv,
+                              int(parts[2]) * 1024, int(cpu * CLK_TCK)))
+    return procs
+
+
+def host_uptime() -> float | None:
+    if IS_DARWIN:
+        m = re.search(r"sec = (\d+)", sysctl("kern.boottime") or "")
+        return time.time() - int(m.group(1)) if m else None
+    uptime = read_text("/proc/uptime")
+    return float(uptime.split()[0]) if uptime else None
+
+
+def darwin_gpu() -> dict:
+    """Apple GPU from the IOAccelerator registry entry: no root needed. Its
+    memory is the share of RAM that iogpu.wired_limit_mb (default about two
+    thirds) lets it wire."""
+    out = run_text(["/usr/sbin/ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
+    if not out:
+        return {}
+
+    def num(key: str) -> int | None:
+        m = re.search(rf'"{re.escape(key)}"=(\d+)', out)
+        return int(m.group(1)) if m else None
+
+    m = re.search(r'"model" = "([^"]+)"', out)
+    cores = re.search(r'"gpu-core-count" = (\d+)', out)
+    name = (m.group(1) if m else "Apple GPU") + (f" ({cores.group(1)}-core GPU)" if cores else "")
+    memsize = int(sysctl("hw.memsize") or 0)
+    limit = int(sysctl("iogpu.wired_limit_mb") or 0) << 20
+    return {"name": name, "busy": num("Device Utilization %"), "pool": "MEM",
+            "gtt_used": num("In use system memory"),
+            "gtt_total": limit or (memsize * 2 // 3 if memsize else None)}
 
 
 DRM_SIZE_RE = re.compile(r"^(\d+)\s*(KiB|MiB|GiB|B)?$")
@@ -1278,6 +1367,8 @@ class Collector:
     @staticmethod
     def _proc_age(pid: int) -> float | None:
         """Seconds since the process started (stat field 22, in clock ticks)."""
+        if IS_DARWIN:
+            return ps_seconds(run_text(["/bin/ps", "-p", str(pid), "-o", "etime="]))
         raw = read_text(f"/proc/{pid}/stat")
         up = read_text("/proc/uptime")
         if not raw or not up:
@@ -1528,8 +1619,7 @@ class Collector:
         if health.get("version"):
             be.extras.append(f"v{health['version']}")
 
-        uptime = read_text("/proc/uptime")
-        uptime_s = float(uptime.split()[0]) if uptime else None
+        uptime_s = host_uptime()
         loaded = health.get("all_models_loaded") or []
         if not loaded:
             be.model = "-"
@@ -1616,6 +1706,8 @@ class Collector:
         the first amdgpu card is then the wrong one. Every card is collected and
         ranked: one with compute processes on it (a loaded model) first, then a
         discrete card before an integrated one, then the larger memory."""
+        if IS_DARWIN:
+            return darwin_gpu()
         cards = self._amd_gpus() + self._nvidia_gpus()
         if not cards:
             return {}
@@ -1747,6 +1839,8 @@ class Collector:
     def _accel_users() -> list[tuple[int, str]]:
         """Processes holding /dev/accel/* open. Without root, only our own."""
         users: list[tuple[int, str]] = []
+        if not os.path.isdir("/proc"):
+            return users
         for entry in os.listdir("/proc"):
             if not entry.isdigit():
                 continue
@@ -1784,6 +1878,9 @@ class Collector:
                 cpu_name = line.split(":", 1)[1].strip()
                 break
         vendor, product = dmi("sys_vendor"), dmi("product_name")
+        if IS_DARWIN:
+            cpu_name = sysctl("machdep.cpu.brand_string")
+            vendor, product = "Apple", sysctl("hw.model")
         machine = (product or "").replace("_", " ")
         if vendor and vendor.lower() not in machine.lower():
             machine = f"{vendor} {machine}".strip()
@@ -1792,6 +1889,8 @@ class Collector:
         return self._machine
 
     def collect_system(self) -> dict:
+        if IS_DARWIN:
+            return self._darwin_system()
         info: dict = dict(self.machine())
         mem = read_text("/proc/meminfo") or ""
         fields = {}
@@ -1823,6 +1922,29 @@ class Collector:
                 if d_total > 0:
                     info["cpu"] = max(0.0, (1 - d_idle / d_total) * 100.0)
             self._prev_cpu_total = (total, idle)
+        return info
+
+    def _darwin_system(self) -> dict:
+        """Memory as Activity Monitor counts it: free, inactive, speculative
+        and purgeable pages could be handed out without swapping. CPU load is
+        the sum of ps' per-process figures, which decay over about a minute."""
+        info: dict = dict(self.machine())
+        info["mem_total"] = int(sysctl("hw.memsize") or 0) or None
+        vm = run_text(["/usr/bin/vm_stat"])
+        m = re.search(r"page size of (\d+) bytes", vm)
+        pages = {k.strip(): int(v.strip(" .")) for k, v in
+                 re.findall(r"^Pages ([^:]+):\s+(\d+)\.", vm, re.M)}
+        if m and info["mem_total"]:
+            avail = sum(pages.get(k, 0) for k in
+                        ("free", "inactive", "speculative", "purgeable")) * int(m.group(1))
+            info["mem_available"] = avail
+            info["mem_used"] = info["mem_total"] - avail
+        info["load"] = [f"{x:.2f}" for x in os.getloadavg()]
+        info["uptime"] = host_uptime()
+        cpu = [float(x) for x in run_text(["/bin/ps", "-A", "-o", "%cpu="]).split()
+               if x.replace(".", "", 1).isdigit()]
+        if cpu:
+            info["cpu"] = min(100.0, sum(cpu) / (os.cpu_count() or 1))
         return info
 
     # -- everything together ------------------------------------------------

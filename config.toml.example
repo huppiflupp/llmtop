@@ -26,7 +26,15 @@ unit_glob_service = "llama-*.service"
 # process CPU, memory or GPU figures. Without /slots, tok/s is the speed of the
 # last finished request, shown while the server is busy; when idle it shows 0.0
 # and the figure moves to the line below.
-urls = []   # e.g. ["http://ai395:8090", {url = "http://192.168.178.54:8091", name = "strix-30b"}]
+# A server that wants an API key: key = "..." or key_file = "~/path" (one key
+# per line, as llama-server reads it).
+#
+# Never list a socket-activated port here: every measurement would load its
+# model. For a host with such backends that runs llmtop itself, use ssh://host:
+# its llmtop is read over ssh (--json-stream) and nothing there is reached over
+# HTTP. command = "..." if llmtop is not on that host's PATH.
+urls = []   # e.g. ["ssh://ai395", {url = "http://192.168.178.54:8091", name = "strix-30b"},
+            #       {url = "http://box:8080", key_file = "~/.config/llama/box-key"}]
 
 [ollama]
 url = "http://127.0.0.1:11434"

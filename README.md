@@ -71,6 +71,28 @@ and if that points at a start script, the script is parsed — including the cas
 where its arguments are collected in a bash array first. If the model file has
 since disappeared, it says so.
 
+A server started with `--api-key` or `--api-key-file` answers `/slots`,
+`/metrics` and `/props` only with that key. llmtop reads it from the process's
+command line (the file on every measurement, so a new key is picked up) and
+sends it as a bearer token; without it every measurement would be a 401 in the
+server's log.
+
+### On another host: `ssh://`
+
+An HTTP endpoint on another machine is blind to all of this: from outside, a
+socket port looks like any other, so measuring it loads the model behind it —
+on a box whose memory is already taken by another model, that can be the
+OOM. And while a backend is up, every probe through its socket counts as use,
+so its idle stop never comes.
+
+For a host that runs llmtop itself, list it as `ssh://host` instead. llmtop
+then starts `llmtop --json-stream` over there through ssh (`BatchMode`, so a key
+must be set up) and shows that host's backends in a panel of their own, read the
+same way as local ones: sleeping backends from systemd, running ones on their
+internal ports, with their keys. Nothing on that host is reached over HTTP from
+here. If llmtop is not on the remote `PATH`, give the command:
+`{url = "ssh://ai395", command = "~/.local/bin/llmtop"}`.
+
 ## Install
 
 ```bash
@@ -100,6 +122,7 @@ llmtop                  # TUI with live graphs
 llmtop -n 1             # refresh every second
 llmtop --once           # print once and exit (meters instead of history)
 llmtop --json           # machine readable, for scripts and status bars
+llmtop --json-stream    # one JSON line per interval (what ssh://host reads)
 llmtop --graph-height 3 # taller graphs; default adapts to the window
 llmtop --background 16  # another xterm-256 background, or "none"
 llmtop --theme orange   # a colour theme: default, orange, or any btop theme
@@ -116,7 +139,9 @@ it, and every change applies at once - theme, graph colours, interval, graph
 height, background, ASCII mode. On the endpoints tab `a` adds a server (type
 its URL, `Enter`), `u` and `n` edit URL and name, `d` deletes, and `Enter`
 tests the selected one right away: the line below shows what answers there
-(`llama.cpp · b392 · qwen3.6-35b-a3b · ctx 256k`) or `unreachable`. New
+(`llama.cpp · b392 · qwen3.6-35b-a3b · ctx 256k`) or `unreachable`; for an
+`ssh://` entry, whether ssh gets in and which llmtop answers. Testing an HTTP
+URL connects to it, so testing a socket port wakes its model. New
 endpoints appear in the Endpoints panel immediately. `s` writes everything to
 the config file, `Esc` closes the menu.
 
@@ -170,6 +195,7 @@ the key bindings.
 | llama.cpp: state, model, context | `systemctl show` on service and socket, start script |
 | llama.cpp: slots, tok/s | `GET /slots` on the internal port, delta of `n_decoded` |
 | Endpoints (`[endpoints] urls`) | name: host in the URL, reverse lookup of an address, or the configured `name`; engine: `owned_by` in `GET /v1/models`, confirmed once by `/props`, `/api/version`, `/version` or `/api/v1/health`; model: `/v1/models`, for Ollama `/api/ps`, for Lemonade `/api/v1/health`; `/slots` if it has one, else `/metrics`: busy from `requests_processing`, tok/s from `tokens_predicted_total` ÷ `tokens_predicted_seconds_total` of finished requests |
+| `ssh://host` | `llmtop --json-stream` on that host, over ssh |
 | Ollama: model, memory, unload timer | `GET /api/ps` (`size_vram`, `context_length`, `expires_at`) |
 | Ollama: model ↔ runner process | manifests under `models/manifests`, blob digest of the model layer |
 | Lemonade: models, backends, idle time | `GET /api/v1/health`, `last_use` against `/proc/uptime` |
@@ -204,7 +230,8 @@ along live.
 
 A server that is neither a `llama-*` unit nor a `llama-server` process — one in a
 container, on another host, or an engine with its own binary name — can be listed
-under `[endpoints] urls`, as a URL or as `{url = "…", name = "…"}`. Such servers get
+under `[endpoints] urls`, as a URL or as `{url = "…", name = "…"}`, with
+`key = "…"` or `key_file = "…"` for one that wants an API key. Such servers get
 their own **Endpoints** panel and are measured over HTTP only, so it shows no process
 CPU, memory or GPU figures. The row is named after the host (`ai395:8090`: the name
 in the URL, a reverse lookup of the address, or the configured `name`), and the detail
@@ -219,6 +246,10 @@ two `/metrics` counters rather than as a rate over wall time (which would jump
 when a request ends and fall back to zero). It is shown as tok/s only while the
 server is busy; when it is idle the column shows a dimmed `0.0` and the figure moves to the
 line below (`last request … tok/s`), so an idle server does not look busy.
+
+Because they are reached over HTTP, **an endpoint must not be a socket port**:
+every measurement would load its model. For a host with socket-activated
+backends use `ssh://host` (see above).
 
 ### Unified memory
 

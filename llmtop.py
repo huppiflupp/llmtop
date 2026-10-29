@@ -16,14 +16,17 @@ and only while the service is already up.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import ipaddress
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -38,7 +41,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.9.1"
+VERSION = "0.10.0"
 # An amdgpu card with at least this much VRAM of its own counts as discrete.
 AMD_DISCRETE_VRAM = 2 << 30
 HTTP_TIMEOUT = 1.5
@@ -84,8 +87,15 @@ def is_ip(host: str) -> bool:
         return False
 
 
-def http_json(url: str, timeout: float = HTTP_TIMEOUT):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+def http_headers(key: str | None, accept: str | None = None) -> dict[str, str]:
+    headers = {"Accept": accept} if accept else {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def http_json(url: str, timeout: float = HTTP_TIMEOUT, key: str | None = None):
+    req = urllib.request.Request(url, headers=http_headers(key, "application/json"))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
@@ -93,9 +103,10 @@ def http_json(url: str, timeout: float = HTTP_TIMEOUT):
         return None
 
 
-def http_text(url: str, timeout: float = HTTP_TIMEOUT) -> str | None:
+def http_text(url: str, timeout: float = HTTP_TIMEOUT, key: str | None = None) -> str | None:
+    req = urllib.request.Request(url, headers=http_headers(key))
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
@@ -679,7 +690,23 @@ LLAMA_FLAGS = {
     "ctx": ("-c", "--ctx-size"),
     "ngl": ("-ngl", "--gpu-layers", "--n-gpu-layers"),
     "parallel": ("-np", "--parallel"),
+    "api_key": ("--api-key",),
+    "api_key_file": ("--api-key-file",),
 }
+
+
+def api_key(cfg: dict) -> str | None:
+    """The key a server wants: --api-key / --api-key-file of a llama-server,
+    or key / key_file of an endpoint. llama.cpp takes a comma-separated list
+    and a file with one key per line; any one of them will do. The file is
+    read on every call, so a changed key is picked up without a restart."""
+    key = cfg.get("api_key") or cfg.get("key")
+    path = cfg.get("api_key_file") or cfg.get("key_file")
+    if not key and path:
+        key = read_text(os.path.expanduser(str(path)))
+    if not key:
+        return None
+    return next((k.strip() for k in re.split(r"[,\n]", str(key)) if k.strip()), None)
 
 
 def parse_llama_argv(argv: list[str]) -> dict:
@@ -879,10 +906,16 @@ class Backend:
     pid: int | None = None
     extras: list[str] = field(default_factory=list)
     children: list["Backend"] = field(default_factory=list)
+    host: str = ""  # set for the backends of an ssh://host endpoint
 
     @property
     def key(self) -> str:
-        return f"{self.kind}:{self.name}"
+        return f"{self.kind}:{self.host}:{self.name}" if self.host else f"{self.kind}:{self.name}"
+
+    @property
+    def group(self) -> str:
+        """The panel it is drawn in: one per kind, and one per remote host."""
+        return f"ssh:{self.host}" if self.host else self.kind
 
 
 @dataclass
@@ -898,6 +931,80 @@ class Snapshot:
 # collectors
 # --------------------------------------------------------------------------
 
+class RemoteFeed:
+    """Another host's llmtop over ssh, one JSON snapshot per line (--json-stream).
+
+    A thread keeps the newest snapshot. ssh runs with BatchMode, so a missing
+    key fails instead of asking for a password in the middle of the display;
+    a connection that ends is tried again every RETRY seconds.
+    """
+
+    RETRY = 15.0
+
+    def __init__(self, host: str, command: str, interval: float) -> None:
+        self.host, self.command, self.interval = host, command, interval
+        self._lock = threading.Lock()
+        self._data: dict | None = None
+        self._got = 0.0
+        self._error: str | None = None
+        self._proc: subprocess.Popen | None = None
+        self._started = 0.0
+        self._start()
+        atexit.register(self.close)
+
+    def _start(self) -> None:
+        self._started = time.monotonic()
+        # A connection of its own (ControlPath=none): a stream that never ends
+        # would otherwise hold one of the sessions of a shared ControlMaster.
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                "-o", "ControlPath=none",
+                "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+                self.host, f"{self.command} --json-stream -n {self.interval:g}"]
+        try:
+            # Its own session: Ctrl-C in the TUI must not reach ssh first.
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True,
+                                    start_new_session=True)
+        except OSError as exc:
+            self._proc, self._error = None, f"ssh: {exc.strerror}"
+            return
+        self._proc = proc
+        errors: deque[str] = deque(maxlen=5)
+        threading.Thread(target=lambda: errors.extend(proc.stderr), daemon=True).start()
+        threading.Thread(target=self._read, args=(proc, errors), daemon=True).start()
+
+    def _read(self, proc: subprocess.Popen, errors: deque[str]) -> None:
+        for line in proc.stdout:
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            with self._lock:
+                self._data, self._got, self._error = data, time.monotonic(), None
+        proc.wait()
+        time.sleep(0.1)  # let the stderr thread catch the last words
+        last = next((e.strip() for e in reversed(errors) if e.strip()), "")
+        with self._lock:
+            self._data = None
+            self._error = last[:80] or f"ssh ended ({proc.returncode})"
+
+    def latest(self) -> tuple[dict | None, str | None]:
+        """(newest snapshot, None) or (None, why there is none)."""
+        with self._lock:
+            data, got, error = self._data, self._got, self._error
+        now = time.monotonic()
+        proc = self._proc
+        if (proc is None or proc.poll() is not None) and now - self._started > self.RETRY:
+            self._start()
+        if data is not None and now - got > max(10.0, 5 * self.interval):
+            return None, f"no data for {int(now - got)} s"
+        return data, error
+
+    def close(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
+
+
 class Collector:
     def __init__(self, cfg: dict) -> None:
         self.cfg = cfg
@@ -909,6 +1016,7 @@ class Collector:
         self._rdns: dict[str, str] = {}  # address -> name, one lookup per host
         self._engines: dict[str, tuple[str, str | None]] = {}  # base url -> (engine, version)
         self.guarded_ports: set[int] = set()
+        self._feeds: dict[str, RemoteFeed] = {}  # ssh host -> its llmtop
         self._npu_name: str | None = None
         self._npu_probed = False
         self._guards_primed = False
@@ -940,13 +1048,13 @@ class Collector:
         return self.rates.rate(key, total)
 
     def _llama_live(self, be: Backend, host: str, port: int, use_metrics: bool,
-                    scheme: str = "http") -> None:
+                    scheme: str = "http", key: str | None = None) -> None:
         """Measure a running backend. Internal ports only, never sockets."""
         if port in self.guarded_ports:
             be.extras.append("skipped measurement (socket port)")
             return
         base = f"{scheme}://{host}:{port}"
-        slots = http_json(f"{base}/slots")
+        slots = http_json(f"{base}/slots", key=key)
         if isinstance(slots, list):
             be.slots_total = len(slots)
             be.slots_busy = sum(1 for s in slots if s.get("is_processing"))
@@ -967,11 +1075,11 @@ class Collector:
             # Fallback only: llamacpp:tokens_predicted_total is written when a
             # task finishes and stands still during generation - /slots counts
             # along live.
-            text = http_text(f"{base}/metrics")
+            text = http_text(f"{base}/metrics", key=key)
             if text:
                 be.tps = self._prom_tokens_per_second(text, f"llama-m:{host}:{port}")
         if be.ctx is None or be.model == "-":
-            props = http_json(f"{base}/props")
+            props = http_json(f"{base}/props", key=key)
             if isinstance(props, dict):
                 if be.model == "-":
                     be.model = model_label(props.get("model_path"))
@@ -1050,7 +1158,7 @@ class Collector:
             self._llama_extras(be, cfg)
             if cfg.get("port"):
                 self._llama_live(be, cfg.get("host") or "127.0.0.1", cfg["port"],
-                                 bool(cfg.get("metrics")))
+                                 bool(cfg.get("metrics")), key=api_key(cfg))
             backends.append(be)
         return backends
 
@@ -1066,16 +1174,22 @@ class Collector:
         if m and m.group(1) in LOCAL_HOSTS:
             seen.add(int(m.group(2)))  # the Ollama panel already shows that one
         backends: list[Backend] = []
+        hosts: set[str] = set()
         for entry in self.cfg["endpoints"].get("urls") or []:
-            if isinstance(entry, dict):
-                url, name = str(entry.get("url") or ""), entry.get("name")
-            else:
-                url, name = str(entry), None
+            entry = entry if isinstance(entry, dict) else {"url": str(entry)}
+            url, name = str(entry.get("url") or ""), entry.get("name")
             if not url:
                 continue
-            be = self._endpoint(url, str(name) if name else None, seen)
+            if url.startswith("ssh://"):
+                host = url[len("ssh://"):].strip("/")
+                hosts.add(host)
+                backends.extend(self._remote(host, str(name) if name else None, entry))
+                continue
+            be = self._endpoint(url, str(name) if name else None, seen, api_key(entry))
             if be:
                 backends.append(be)
+        for host in set(self._feeds) - hosts:  # removed from the config
+            self._feeds.pop(host).close()
         return backends
 
     def _endpoint_name(self, host: str, port: int, name: str | None) -> str:
@@ -1098,7 +1212,8 @@ class Collector:
             label = label.split(".")[0]  # ai395.fritz.box -> ai395
         return f"{label}:{port}"
 
-    def _engine_of(self, base: str, owner: str | None) -> tuple[str, str | None]:
+    def _engine_of(self, base: str, owner: str | None,
+                   key: str | None = None) -> tuple[str, str | None]:
         """Which program answers at `base`, and its version.
 
         owned_by in /v1/models names the engine for the ones we know; a version
@@ -1113,26 +1228,27 @@ class Collector:
         version = None
         if engine == "llama.cpp" or not known:
             # llama.cpp and the engines built on it answer /props with a build id
-            props = http_json(f"{base}/props")
+            props = http_json(f"{base}/props", key=key)
             if isinstance(props, dict) and props.get("build_info"):
                 version = str(props["build_info"]).split("-")[0]
                 engine = engine or "llama.cpp"
         if engine == "Ollama" or not known:
-            ver = http_json(f"{base}/api/version")
+            ver = http_json(f"{base}/api/version", key=key)
             if isinstance(ver, dict) and ver.get("version"):
                 engine, version = "Ollama", f"v{ver['version']}"
         if engine == "vLLM" or not known:
-            ver = http_json(f"{base}/version")
+            ver = http_json(f"{base}/version", key=key)
             if isinstance(ver, dict) and ver.get("version"):
                 engine, version = "vLLM", f"v{ver['version']}"
         if engine == "Lemonade" or not known:
-            health = http_json(f"{base}/api/v1/health")
+            health = http_json(f"{base}/api/v1/health", key=key)
             if isinstance(health, dict) and health.get("version"):
                 engine, version = "Lemonade", f"v{health['version']}"
         self._engines[base] = (engine, version)
         return engine, version
 
-    def _endpoint(self, url: str, name: str | None, seen_ports: set[int]) -> Backend | None:
+    def _endpoint(self, url: str, name: str | None, seen_ports: set[int],
+                  key: str | None = None) -> Backend | None:
         """A server named in the config, measured over HTTP only."""
         parts = urllib.parse.urlsplit(url if "://" in url else f"http://{url}")
         host = parts.hostname or "127.0.0.1"
@@ -1142,7 +1258,7 @@ class Collector:
         scheme = parts.scheme or "http"
         base = f"{scheme}://{host}:{port}"
         be = Backend(kind="endpoint", name=self._endpoint_name(host, port, name), port=port)
-        models = http_json(f"{base}/v1/models")
+        models = http_json(f"{base}/v1/models", key=key)
         if not isinstance(models, dict):
             be.state = STOPPED
             be.extras.append("unreachable")
@@ -1151,31 +1267,71 @@ class Collector:
         be.state = RUNNING
         data = models.get("data") or []
         first = data[0] if data and isinstance(data[0], dict) else {}
-        engine, version = self._engine_of(base, first.get("owned_by"))
+        engine, version = self._engine_of(base, first.get("owned_by"), key)
         be.detail = engine
         if version:
             be.extras.append(version)
         if engine == "Ollama":
-            self._ollama_endpoint(be, base)
+            self._ollama_endpoint(be, base, key)
             return be
         if engine == "Lemonade":
-            self._lemonade_endpoint(be, base)
+            self._lemonade_endpoint(be, base, key)
             return be
         be.model = model_label(None, first.get("id")) if first.get("id") else "-"
         meta = first.get("meta") if isinstance(first.get("meta"), dict) else {}
         be.ctx = meta.get("n_ctx") or first.get("max_model_len") or first.get("context_length")
-        slots = http_json(f"{base}/slots")
+        slots = http_json(f"{base}/slots", key=key)
         if isinstance(slots, list):
-            self._llama_live(be, host, port, True, scheme)
+            self._llama_live(be, host, port, True, scheme, key)
         else:
-            self._metrics_live(be, base)
+            self._metrics_live(be, base, key)
         return be
 
-    def _ollama_endpoint(self, be: Backend, base: str) -> None:
+    def wait_remote(self, timeout: float) -> None:
+        """For a single snapshot: give ssh://host endpoints time for a first answer."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and any(
+                f.latest() == (None, None) for f in self._feeds.values()):
+            time.sleep(0.2)
+
+    def _remote(self, host: str, name: str | None, entry: dict) -> list[Backend]:
+        """The backends of another host as its own llmtop sees them (ssh://host).
+
+        No HTTP from here: a socket port answers any connection by loading its
+        model, and while one is up every probe through the socket resets its
+        idle timer. The llmtop over there reads systemd for sleeping backends
+        and measures running ones on their internal ports, with their keys.
+        """
+        feed = self._feeds.get(host)
+        if feed is None:
+            interval = max(1.0, float(self.cfg["ui"].get("interval") or 2.0))
+            feed = RemoteFeed(host, str(entry.get("command") or "llmtop"), interval)
+            self._feeds[host] = feed
+        label = name or host
+        data, error = feed.latest()
+        if data is None:
+            be = Backend(kind="endpoint", name=label, state=STOPPED, detail="ssh")
+            be.extras.append(error or "connecting …")
+            return [be]
+        backends: list[Backend] = []
+        for raw in data.get("backends") or []:
+            kind = raw.get("kind")
+            # Its own endpoints could be this host again; an idle Ollama or a
+            # missing Lemonade is only noise from afar.
+            if kind not in ("llama", "ollama", "lemonade"):
+                continue
+            if kind != "llama" and raw.get("state") != RUNNING:
+                continue
+            be = backend_from_dict(raw)
+            be.kind, be.host = "endpoint", label
+            backends.append(be)
+        return backends
+
+    def _ollama_endpoint(self, be: Backend, base: str, key: str | None = None) -> None:
         """An Ollama reached over HTTP. /v1/models lists its whole library; the
         model it has loaded is in /api/ps, as in the Ollama panel, minus the
         runner process."""
-        ps = http_json(f"{base}/api/ps")
+        ps = http_json(f"{base}/api/ps", key=key)
         models = ps.get("models") if isinstance(ps, dict) else None
         if not models:
             be.model = "-"
@@ -1194,9 +1350,9 @@ class Collector:
             be.mem_kind = "GPU"
             be.children = children
 
-    def _lemonade_endpoint(self, be: Backend, base: str) -> None:
+    def _lemonade_endpoint(self, be: Backend, base: str, key: str | None = None) -> None:
         """A Lemonade reached over HTTP: the loaded models are in /api/v1/health."""
-        health = http_json(f"{base}/api/v1/health")
+        health = http_json(f"{base}/api/v1/health", key=key)
         loaded = health.get("all_models_loaded") if isinstance(health, dict) else None
         if not loaded:
             be.model = "-"
@@ -1222,9 +1378,9 @@ class Collector:
             be.busy = any(c.busy for c in children)
             be.children = children
 
-    def _metrics_live(self, be: Backend, base: str) -> None:
+    def _metrics_live(self, be: Backend, base: str, key: str | None = None) -> None:
         """Busy and speed from /metrics alone, for servers without /slots."""
-        text = http_text(f"{base}/metrics")
+        text = http_text(f"{base}/metrics", key=key)
         if not text:
             be.extras.append("no /metrics")
             return
@@ -1306,7 +1462,7 @@ class Collector:
                     cfg = {**cfg, **live}
             if cfg.get("port"):
                 self._llama_live(be, cfg.get("host") or "127.0.0.1", cfg["port"],
-                                 bool(cfg.get("metrics")))
+                                 bool(cfg.get("metrics")), key=api_key(cfg))
         elif socket_unit:
             be.state = SLEEPING
             be.port = sock_port
@@ -2570,8 +2726,9 @@ class Renderer:
         out = self._system_panel(snap, lay, live)
         by_kind: dict[str, list[Backend]] = {}
         for be in snap.backends:
-            by_kind.setdefault(be.kind, []).append(be)
-        kinds = [k for k in ("llama", "endpoint", "ollama", "lemonade", "bench")
+            by_kind.setdefault(be.group, []).append(be)
+        remote = [k for k in by_kind if k.startswith("ssh:")]
+        kinds = [k for k in ("llama", "endpoint", *remote, "ollama", "lemonade", "bench")
                  if by_kind.get(k)]
 
         keys: list[Seg] = []
@@ -2602,9 +2759,10 @@ class Renderer:
                         # Stacked: keep each backend's lines together.
                         left.extend(lrows)
                         left.extend(r for r, has in rrows if has)
-            top = {"left": [(KIND_TITLE[kind], "title")],
+            title = KIND_TITLE.get(kind) or f"{kind[len('ssh:'):]} (ssh)"
+            top = {"left": [(title, "title")],
                    "right": [(self._summary(group), "label")]}
-            out += self._panel(lay, BOX_STYLE[kind], left, right, top,
+            out += self._panel(lay, BOX_STYLE.get(kind, BOX_STYLE["endpoint"]), left, right, top,
                                footer if n == len(kinds) - 1 else {})
         return out
 
@@ -2951,9 +3109,32 @@ def backend_to_dict(be: Backend) -> dict:
         "last_use_seconds_ago": be.last_use,
         "port": be.port, "pid": be.pid, "extras": be.extras,
     }
+    if be.host:
+        data["host"] = be.host
     if be.children:
         data["models"] = [backend_to_dict(c) for c in be.children]
     return data
+
+
+def backend_from_dict(data: dict) -> Backend:
+    """The reverse of backend_to_dict, for a snapshot read from another host."""
+    be = Backend(kind=str(data.get("kind") or ""), name=str(data.get("name") or "?"))
+    be.state, be.detail = data.get("state") or ABSENT, data.get("detail") or ""
+    be.model, be.ctx = data.get("model") or "-", data.get("ctx")
+    be.mem, be.mem_kind = data.get("memory_bytes"), data.get("memory_kind") or ""
+    be.cpu, be.gpu_mem = data.get("cpu_percent"), data.get("gpu_memory_bytes")
+    be.gpu_util = data.get("gpu_percent")
+    be.gpu_estimated = bool(data.get("gpu_percent_estimated"))
+    be.tps, be.busy = data.get("tokens_per_second"), bool(data.get("busy"))
+    be.slots_busy = int(data.get("slots_busy") or 0)
+    be.slots_total = int(data.get("slots_total") or 0)
+    be.idle_in, be.since = data.get("unload_in_seconds"), data.get("since_seconds")
+    be.last_use = data.get("last_use_seconds_ago")
+    be.port, be.pid = data.get("port"), data.get("pid")
+    be.extras = list(data.get("extras") or [])
+    be.host = str(data.get("host") or "")
+    be.children = [backend_from_dict(c) for c in data.get("models") or []]
+    return be
 
 
 def snapshot_to_dict(snap: Snapshot) -> dict:
@@ -3162,7 +3343,9 @@ class Menu:
         for entry in endpoints:
             if isinstance(entry, dict):
                 if entry.get("url"):
-                    self.endpoints.append({"url": str(entry["url"]), "name": entry.get("name")})
+                    # key, key_file, command: kept as they are, not edited here
+                    self.endpoints.append({**entry, "url": str(entry["url"]),
+                                           "name": entry.get("name")})
             elif str(entry):
                 self.endpoints.append({"url": str(entry), "name": None})
         self.edit: dict | None = None  # {"field", "index", "buffer"}
@@ -3174,8 +3357,11 @@ class Menu:
     # -- state ------------------------------------------------------------
 
     def export(self) -> list:
-        return [{"url": e["url"], "name": e["name"]} if e.get("name") else e["url"]
-                for e in self.endpoints]
+        out: list = []
+        for e in self.endpoints:
+            entry = {k: v for k, v in e.items() if v not in (None, "")}
+            out.append(entry if set(entry) - {"url"} else e["url"])
+        return out
 
     def _push_endpoints(self) -> None:
         self.collector.cfg["endpoints"]["urls"] = self.export()
@@ -3213,8 +3399,12 @@ class Menu:
         self.tests[url] = "testing …"
 
         def run() -> None:
+            if url.startswith("ssh://"):
+                self.tests[url] = self._test_ssh(url[len("ssh://"):].strip("/"),
+                                                 str(entry.get("command") or "llmtop"))
+                return
             try:
-                be = self.collector._endpoint(url, entry.get("name"), set())
+                be = self.collector._endpoint(url, entry.get("name"), set(), api_key(entry))
             except Exception as exc:  # a bad URL must not take the display down
                 self.tests[url] = f"error: {exc}"
                 return
@@ -3230,6 +3420,21 @@ class Menu:
             self.tests[url] = text
 
         threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _test_ssh(host: str, command: str) -> str:
+        """Whether ssh gets in without a password and finds llmtop there."""
+        try:
+            res = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                                  host, f"{command} --version"],
+                                 capture_output=True, text=True, timeout=15,
+                                 stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"ssh: {exc}"
+        if res.returncode != 0:
+            lines = (res.stderr or "").strip().splitlines()
+            return (lines[-1] if lines else f"ssh ended ({res.returncode})")[:80]
+        return f"{res.stdout.strip()} over ssh"
 
     def save(self) -> None:
         try:
@@ -3567,6 +3772,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-1", "--once", action="store_true",
                         help="print once instead of running the TUI")
     parser.add_argument("--json", action="store_true", help="print JSON and exit")
+    parser.add_argument("--json-stream", action="store_true",
+                        help="print one JSON line per interval, for ssh://host "
+                             "endpoints on another machine")
     parser.add_argument("-n", "--interval", type=float, default=None,
                         help="refresh interval in seconds (default 2)")
     parser.add_argument("--graph-height", default=None,
@@ -3600,11 +3808,26 @@ def main(argv: list[str] | None = None) -> int:
         """Measure twice: CPU percentages and tok/s only exist as a delta."""
         collector.snapshot()
         time.sleep(min(1.0, max(0.3, interval / 2)))
+        collector.wait_remote(8.0)
         return collector.snapshot()
+
+    # atexit only runs on a normal exit: ssh to other hosts must not outlive us
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     if args.json:
         print(json.dumps(snapshot_to_dict(sampled()), indent=2, ensure_ascii=False))
         return 0
+
+    if args.json_stream:
+        try:
+            while True:
+                started = time.monotonic()
+                line = json.dumps(snapshot_to_dict(collector.snapshot()), ensure_ascii=False)
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+                time.sleep(max(0.0, interval - (time.monotonic() - started)))
+        except (BrokenPipeError, KeyboardInterrupt):  # the reading side went away
+            return 0
 
     if args.once:
         size = shutil.get_terminal_size((100, 30))

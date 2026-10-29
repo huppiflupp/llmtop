@@ -42,8 +42,11 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
 VERSION = "0.10.0"
-# An amdgpu card with at least this much VRAM of its own counts as discrete.
+# An amdgpu card with at least this much VRAM of its own counts as discrete,
+# when sysfs does not say (mem_info_vram_vendor exists for real VRAM only).
 AMD_DISCRETE_VRAM = 2 << 30
+# A card holding this much (VRAM + GTT) has a model loaded, not just a desktop.
+GPU_MODEL_MEM = 4 << 30
 HTTP_TIMEOUT = 1.5
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -328,7 +331,7 @@ class ProcInfo:
 
 def proc_read(pid: int) -> ProcInfo | None:
     if IS_DARWIN:
-        return next(iter(darwin_procs(pid)), None)
+        return darwin_proc_table().get(pid)
     base = f"/proc/{pid}"
     raw = read_text(f"{base}/stat")
     if raw is None:
@@ -354,7 +357,7 @@ def proc_read(pid: int) -> ProcInfo | None:
 
 def proc_all() -> list[ProcInfo]:
     if IS_DARWIN:
-        return darwin_procs()
+        return list(darwin_proc_table().values())
     procs = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -383,6 +386,16 @@ def proc_scan(pattern: re.Pattern[str],
     return found
 
 
+def nvidia_suspended() -> bool:
+    """True if there are NVIDIA display devices and all of them sleep in
+    runtime power management (a hybrid laptop with the dGPU off)."""
+    devs = [d for d in Path("/sys/bus/pci/devices").glob("*")
+            if read_text(d / "vendor") == "0x10de"
+            and (read_text(d / "class") or "").startswith("0x03")]
+    return bool(devs) and all(read_text(d / "power" / "runtime_status") == "suspended"
+                              for d in devs)
+
+
 # --------------------------------------------------------------------------
 # macOS: no /proc and no /sys, so ps, sysctl, vm_stat and ioreg stand in
 # --------------------------------------------------------------------------
@@ -391,9 +404,11 @@ IS_DARWIN = sys.platform == "darwin"
 
 
 def run_text(argv: list[str], timeout: float = 5) -> str:
+    # C locale: ps writes "12,3" and "0:01,23" under a German one
+    env = {**os.environ, "LC_ALL": "C"}
     try:
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL).stdout
+                              stdin=subprocess.DEVNULL, env=env).stdout
     except (subprocess.SubprocessError, OSError):
         return ""
 
@@ -436,6 +451,20 @@ def darwin_procs(pid: int | None = None) -> list["ProcInfo"]:
         procs.append(ProcInfo(p, int(parts[1]), comms.get(p, ""), argv,
                               int(parts[2]) * 1024, int(cpu * CLK_TCK)))
     return procs
+
+
+_darwin_table: tuple[float, dict[int, "ProcInfo"]] = (0.0, {})
+
+
+def darwin_proc_table() -> dict[int, "ProcInfo"]:
+    """All processes by PID, from one pair of ps calls per measurement rather
+    than a pair for every process looked up."""
+    global _darwin_table
+    taken, table = _darwin_table
+    if time.monotonic() - taken > 0.25:
+        table = {p.pid: p for p in darwin_procs()}
+        _darwin_table = (time.monotonic(), table)
+    return table
 
 
 def host_uptime() -> float | None:
@@ -1907,7 +1936,8 @@ class Collector:
         discrete card before an integrated one, then the larger memory."""
         if IS_DARWIN:
             return darwin_gpu()
-        cards = self._amd_gpus() + self._nvidia_gpus()
+        amd = self._amd_gpus()
+        cards = amd + self._nvidia_gpus(rank=bool(amd))
         if not cards:
             return {}
         best = max(cards, key=lambda g: (g.pop("_compute", False),
@@ -1937,9 +1967,17 @@ class Collector:
                          "gtt_used": read_int(dev / "mem_info_gtt_used"),
                          "gtt_total": read_int(dev / "mem_info_gtt_total"),
                          "card": card.name}
-            # An APU has a small carve-out (or none) and lives on its GTT; a
-            # discrete card brings gigabytes of its own VRAM.
-            gpu["_discrete"] = (gpu["vram_total"] or 0) >= AMD_DISCRETE_VRAM
+            # Only a card with VRAM chips of its own names their vendor; an APU's
+            # carve-out can be gigabytes too (a 64/64 BIOS split on Strix Halo).
+            if (dev / "mem_info_vram_vendor").exists():
+                gpu["_discrete"] = True
+            elif "radeon" in (self.machine().get("cpu_name") or "").lower():
+                gpu["_discrete"] = False
+            else:
+                gpu["_discrete"] = (gpu["vram_total"] or 0) >= AMD_DISCRETE_VRAM
+            # amdgpu lists no compute processes; a loaded model shows as memory
+            held = (gpu["vram_used"] or 0) + (gpu["gtt_used"] or 0)
+            gpu["_compute"] = held >= GPU_MODEL_MEM
             sclk = read_text(dev / "pp_dpm_sclk") or ""
             current = [ln for ln in sclk.splitlines() if ln.endswith("*")]
             if current:
@@ -1954,8 +1992,12 @@ class Collector:
             out.append(gpu)
         return out
 
-    def _nvidia_gpus(self) -> list[dict]:
-        if not shutil.which("nvidia-smi"):
+    def _nvidia_gpus(self, rank: bool) -> list[dict]:
+        """NVIDIA cards via nvidia-smi. Not while every one of them is in
+        runtime suspend: asking would power it up. Which one has compute
+        processes is only asked when there is more than one card to choose
+        from - it is a second nvidia-smi run."""
+        if not shutil.which("nvidia-smi") or nvidia_suspended():
             return []
 
         def smi(*args: str) -> str:
@@ -1971,11 +2013,14 @@ class Collector:
                   "power.draw,temperature.gpu")
         if not out:
             return []
-        busy_uuids = {ln.split(",")[0].strip()
-                      for ln in smi("--query-compute-apps=gpu_uuid,pid").splitlines()
-                      if ln.strip()}
+        lines = out.splitlines()
+        busy_uuids = set()
+        if rank or len(lines) > 1:
+            busy_uuids = {ln.split(",")[0].strip()
+                          for ln in smi("--query-compute-apps=gpu_uuid,pid").splitlines()
+                          if ln.strip()}
         cards = []
-        for n, line in enumerate(out.splitlines()):
+        for n, line in enumerate(lines):
             f = [x.strip() for x in line.split(",")]
 
             def num(idx, scale=1.0):

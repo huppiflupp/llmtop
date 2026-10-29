@@ -709,6 +709,26 @@ def api_key(cfg: dict) -> str | None:
     return next((k.strip() for k in re.split(r"[,\n]", str(key)) if k.strip()), None)
 
 
+def llama_key(be: "Backend", cfg: dict) -> str | None:
+    """api_key() for a running llama-server: a relative --api-key-file counts
+    from its working directory, and LLAMA_API_KEY in its environment is a key
+    too (both only readable for one's own processes). A key it wants but we
+    cannot read is noted on the row - the measurements are 401s without it."""
+    if be.pid:
+        path = cfg.get("api_key_file")
+        if path and not os.path.isabs(os.path.expanduser(str(path))):
+            cfg = {**cfg, "api_key_file": os.path.join(f"/proc/{be.pid}/cwd", str(path))}
+        if not cfg.get("api_key") and not path:
+            raw = read_text(f"/proc/{be.pid}/environ") or ""
+            env = dict(v.split("=", 1) for v in raw.split("\0") if "=" in v)
+            if env.get("LLAMA_API_KEY"):
+                cfg = {**cfg, "api_key": env["LLAMA_API_KEY"]}
+    key = api_key(cfg)
+    if key is None and cfg.get("api_key_file"):
+        be.extras.append("api key unreadable")
+    return key
+
+
 def parse_llama_argv(argv: list[str]) -> dict:
     """Pull the llama-server options that matter for the display."""
     out: dict = {}
@@ -931,6 +951,10 @@ class Snapshot:
 # collectors
 # --------------------------------------------------------------------------
 
+# [user@]host[:port] as in ~/.ssh/config, and never something ssh reads as an option
+SSH_HOST = re.compile(r"^(?!-)[\w.@:\[\]-]+$")
+
+
 class RemoteFeed:
     """Another host's llmtop over ssh, one JSON snapshot per line (--json-stream).
 
@@ -949,17 +973,19 @@ class RemoteFeed:
         self._error: str | None = None
         self._proc: subprocess.Popen | None = None
         self._started = 0.0
-        self._start()
+        with self._lock:
+            self._start()
         atexit.register(self.close)
 
     def _start(self) -> None:
+        """Start ssh. Called with the lock held."""
         self._started = time.monotonic()
         # A connection of its own (ControlPath=none): a stream that never ends
         # would otherwise hold one of the sessions of a shared ControlMaster.
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                 "-o", "ControlPath=none",
                 "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
-                self.host, f"{self.command} --json-stream -n {self.interval:g}"]
+                "--", self.host, f"{self.command} --json-stream -n {self.interval:g}"]
         try:
             # Its own session: Ctrl-C in the TUI must not reach ssh first.
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -980,29 +1006,35 @@ class RemoteFeed:
             except ValueError:
                 continue
             with self._lock:
+                if proc is not self._proc:  # replaced by a newer connection
+                    return
                 self._data, self._got, self._error = data, time.monotonic(), None
         proc.wait()
         time.sleep(0.1)  # let the stderr thread catch the last words
         last = next((e.strip() for e in reversed(errors) if e.strip()), "")
         with self._lock:
-            self._data = None
-            self._error = last[:80] or f"ssh ended ({proc.returncode})"
+            if proc is self._proc:
+                self._data = None
+                self._error = last[:80] or f"ssh ended ({proc.returncode})"
 
     def latest(self) -> tuple[dict | None, str | None]:
         """(newest snapshot, None) or (None, why there is none)."""
+        now = time.monotonic()
         with self._lock:
             data, got, error = self._data, self._got, self._error
-        now = time.monotonic()
-        proc = self._proc
-        if (proc is None or proc.poll() is not None) and now - self._started > self.RETRY:
-            self._start()
+            proc = self._proc
+            if (proc is None or proc.poll() is not None) and now - self._started > self.RETRY:
+                self._start()
         if data is not None and now - got > max(10.0, 5 * self.interval):
             return None, f"no data for {int(now - got)} s"
         return data, error
 
     def close(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.terminate()
+        with self._lock:
+            proc, self._proc = self._proc, None
+            self._started = float("inf")  # and no restart after this
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
 
 
 class Collector:
@@ -1017,6 +1049,9 @@ class Collector:
         self._engines: dict[str, tuple[str, str | None]] = {}  # base url -> (engine, version)
         self.guarded_ports: set[int] = set()
         self._feeds: dict[str, RemoteFeed] = {}  # ssh host -> its llmtop
+        # False under --json-stream: that stream is read by another llmtop,
+        # which drops endpoints, and following ssh:// there could loop back.
+        self.follow_endpoints = True
         self._npu_name: str | None = None
         self._npu_probed = False
         self._guards_primed = False
@@ -1158,7 +1193,7 @@ class Collector:
             self._llama_extras(be, cfg)
             if cfg.get("port"):
                 self._llama_live(be, cfg.get("host") or "127.0.0.1", cfg["port"],
-                                 bool(cfg.get("metrics")), key=api_key(cfg))
+                                 bool(cfg.get("metrics")), key=llama_key(be, cfg))
             backends.append(be)
         return backends
 
@@ -1182,6 +1217,11 @@ class Collector:
                 continue
             if url.startswith("ssh://"):
                 host = url[len("ssh://"):].strip("/")
+                if not SSH_HOST.match(host):
+                    be = Backend(kind="endpoint", name=str(name or host), state=STOPPED,
+                                 detail="ssh", extras=["not a host name"])
+                    backends.append(be)
+                    continue
                 hosts.add(host)
                 backends.extend(self._remote(host, str(name) if name else None, entry))
                 continue
@@ -1310,7 +1350,7 @@ class Collector:
         label = name or host
         data, error = feed.latest()
         if data is None:
-            be = Backend(kind="endpoint", name=label, state=STOPPED, detail="ssh")
+            be = Backend(kind="endpoint", name="ssh", state=STOPPED, detail="ssh", host=label)
             be.extras.append(error or "connecting …")
             return [be]
         backends: list[Backend] = []
@@ -1325,6 +1365,9 @@ class Collector:
             be = backend_from_dict(raw)
             be.kind, be.host = "endpoint", label
             backends.append(be)
+        if not backends:
+            backends.append(Backend(kind="endpoint", name="ssh", state=RUNNING, detail="ssh",
+                                    host=label, extras=["no backends there"]))
         return backends
 
     def _ollama_endpoint(self, be: Backend, base: str, key: str | None = None) -> None:
@@ -1462,7 +1505,7 @@ class Collector:
                     cfg = {**cfg, **live}
             if cfg.get("port"):
                 self._llama_live(be, cfg.get("host") or "127.0.0.1", cfg["port"],
-                                 bool(cfg.get("metrics")), key=api_key(cfg))
+                                 bool(cfg.get("metrics")), key=llama_key(be, cfg))
         elif socket_unit:
             be.state = SLEEPING
             be.port = sock_port
@@ -2130,7 +2173,7 @@ class Collector:
             snap.npu = f_npu.result()
             snap.system = f_sys.result()
         llama = self.collect_llama(o_pids | l_pids)
-        endpoints = self.collect_endpoints(llama)
+        endpoints = self.collect_endpoints(llama) if self.follow_endpoints else []
         bench = self.collect_bench(o_pids | l_pids)
         snap.backends = [*llama, *endpoints, ollama, lemon, *bench]
         attribute_gpu(snap)
@@ -3425,8 +3468,11 @@ class Menu:
     def _test_ssh(host: str, command: str) -> str:
         """Whether ssh gets in without a password and finds llmtop there."""
         try:
+            if not SSH_HOST.match(host):
+                return f"not a host name: {host!r}"
             res = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                                  host, f"{command} --version"],
+                                  "-o", "ControlPath=none",
+                                  "--", host, f"{command} --version"],
                                  capture_output=True, text=True, timeout=15,
                                  stdin=subprocess.DEVNULL)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -3811,14 +3857,17 @@ def main(argv: list[str] | None = None) -> int:
         collector.wait_remote(8.0)
         return collector.snapshot()
 
-    # atexit only runs on a normal exit: ssh to other hosts must not outlive us
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    # atexit only runs on a normal exit: ssh to other hosts must not outlive us,
+    # also not a closed terminal (SIGHUP) - they run in sessions of their own.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
 
     if args.json:
         print(json.dumps(snapshot_to_dict(sampled()), indent=2, ensure_ascii=False))
         return 0
 
     if args.json_stream:
+        collector.follow_endpoints = False
         try:
             while True:
                 started = time.monotonic()

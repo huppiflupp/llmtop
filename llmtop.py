@@ -41,7 +41,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 # An amdgpu card with at least this much VRAM of its own counts as discrete,
 # when sysfs does not say (mem_info_vram_vendor exists for real VRAM only).
 AMD_DISCRETE_VRAM = 2 << 30
@@ -79,7 +79,8 @@ LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 # What /v1/models says in owned_by, per engine. Anything else is shown verbatim.
 ENGINE_BY_OWNER = {"llamacpp": "llama.cpp", "library": "Ollama", "vllm": "vLLM",
-                   "organization_owner": "LM Studio", "lemonade": "Lemonade"}
+                   "organization_owner": "LM Studio", "lemonade": "Lemonade",
+                   "gufo": "Gufo"}
 
 
 def is_ip(host: str) -> bool:
@@ -715,10 +716,10 @@ LLAMA_FLAGS = {
     "port": ("--port",),
     "host": ("--host",),
     "model": ("-m", "--model"),
-    "alias": ("-a", "--alias", "--model-alias"),
-    "ctx": ("-c", "--ctx-size"),
+    "alias": ("-a", "--alias", "--model-alias", "--served-model-name"),
+    "ctx": ("-c", "--ctx-size", "--context"),
     "ngl": ("-ngl", "--gpu-layers", "--n-gpu-layers"),
-    "parallel": ("-np", "--parallel"),
+    "parallel": ("-np", "--parallel", "--sessions"),
     "api_key": ("--api-key",),
     "api_key_file": ("--api-key-file",),
 }
@@ -785,9 +786,32 @@ def parse_llama_argv(argv: list[str]) -> dict:
     if "--no-slots" in argv:
         out["slots"] = False
     spec = next((argv[i + 1] for i, t in enumerate(argv)
-                 if t == "--spec-type" and i + 1 < len(argv)), None)
-    if spec:
+                 if t in ("--spec-type", "--speculative") and i + 1 < len(argv)), None)
+    if spec and spec != "off":
         out["draft"] = spec
+    return out
+
+
+def parse_container(tokens: list[str]) -> dict:
+    """`podman run` or `docker run` in a start script: which runtime, the
+    container's name, and where its ports are published on the host."""
+    run = next((i for i, t in enumerate(tokens[:-1])
+                if os.path.basename(t) in ("podman", "docker") and tokens[i + 1] == "run"), None)
+    if run is None:
+        return {}
+    out: dict = {"runtime": os.path.basename(tokens[run]), "name": None, "ports": {}}
+    for i, tok in enumerate(tokens[run + 2:], run + 2):
+        flag, eq, value = tok.partition("=")
+        if not eq:
+            value = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if flag == "--name":
+            out["name"] = value
+        elif flag in ("-p", "--publish"):
+            # [ip:]host:container[/proto]
+            parts = value.split("/")[0].rsplit(":", 2)
+            if len(parts) >= 2 and parts[-1].isdigit() and parts[-2].isdigit():
+                ip = parts[0] if len(parts) == 3 and parts[0] else "127.0.0.1"
+                out["ports"][int(parts[-1])] = (ip, int(parts[-2]))
     return out
 
 
@@ -869,6 +893,11 @@ def execstart_argv(show_value: str) -> list[str]:
     return matches[-1].split()
 
 
+# Servers that speak llama-server's /slots and take its options in a start script.
+GUFO_IN_SCRIPT = re.compile(r"\bgufo\s+serve\b")
+SERVER_IN_SCRIPT = re.compile(r"llama-server|\bgufo\s+serve\b")
+
+
 def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
     """Find llama-server options even when ExecStart points at a script."""
     if not argv:
@@ -908,11 +937,23 @@ def resolve_llama_config(argv: list[str], depth: int = 0) -> dict:
         return text
 
     for line in body.splitlines():
-        if "llama-server" not in line:
+        if line.lstrip().startswith("#") or not SERVER_IN_SCRIPT.search(line):
             continue
         tokens = [t.strip('"').strip("'") for t in expand(line).split()]
         cfg.update(parse_llama_argv(tokens))
-    if (cfg.get("model") or cfg.get("port")) or "llama-server" not in body:
+        if GUFO_IN_SCRIPT.search(line):
+            cfg["engine"] = "gufo"
+        box = parse_container(tokens)
+        if box:
+            # The server names its port inside the container; from here it is
+            # reached where that port is published.
+            cfg["container"] = (box["runtime"], box["name"])
+            published = box["ports"].get(cfg.get("port"))
+            cfg.pop("port", None)
+            cfg.pop("host", None)
+            if published:
+                cfg["host"], cfg["port"] = published
+    if (cfg.get("model") or cfg.get("port")) or not SERVER_IN_SCRIPT.search(body):
         return cfg
     # The invocation line carried nothing useful - typical for scripts that
     # collect options in a bash array and pass them as "${ARGS[@]}". Then read
@@ -1077,6 +1118,7 @@ class Collector:
         self._rdns: dict[str, str] = {}  # address -> name, one lookup per host
         self._engines: dict[str, tuple[str, str | None]] = {}  # base url -> (engine, version)
         self.guarded_ports: set[int] = set()
+        self._containers: dict[tuple, tuple[int, float]] = {}  # (runtime, name) -> (pid, retry)
         self._feeds: dict[str, RemoteFeed] = {}  # ssh host -> its llmtop
         # False under --json-stream: that stream is read by another llmtop,
         # which drops endpoints, and following ssh:// there could loop back.
@@ -1151,7 +1193,29 @@ class Collector:
                 be.ctx = be.ctx or gen.get("n_ctx")
                 be.slots_total = be.slots_total or (props.get("total_slots") or 0)
 
+    def _container_proc(self, box: tuple[str, str | None]) -> "ProcInfo | None":
+        """The server inside a container. The unit's MainPID is only the runtime's
+        client, and the server lives outside the unit's cgroup. Asking the
+        runtime costs a process, so the answer is kept until that server is gone;
+        a miss (still starting) is asked again after a few seconds."""
+        runtime, name = box
+        if not name:
+            return None
+        pid, retry = self._containers.get(box, (0, 0.0))
+        info = proc_read(pid) if pid else None
+        if info is not None:
+            return info
+        now = time.monotonic()
+        if now < retry:
+            return None
+        text = run_text([runtime, "inspect", "-f", "{{.State.Pid}}", name]).strip()
+        pid = int(text) if text.isdigit() else 0
+        self._containers[box] = (pid, now + 5)
+        return proc_read(pid) if pid else None
+
     def _llama_extras(self, be: Backend, cfg: dict) -> None:
+        if cfg.get("engine"):
+            be.extras.append(cfg["engine"])
         if cfg.get("draft"):
             be.extras.append(f"draft {cfg['draft']}")
         if cfg.get("flash_attn"):
@@ -1504,7 +1568,8 @@ class Collector:
         be.model = model_label(cfg.get("model"), cfg.get("alias"))
         self._llama_extras(be, cfg)
         path = cfg.get("model")
-        if path and not path.startswith("$") and not os.path.exists(path):
+        # A path in a container means nothing out here.
+        if path and not path.startswith("$") and not cfg.get("container") and not os.path.exists(path):
             be.extras.append("model file missing")
 
         sock_port = None
@@ -1520,17 +1585,24 @@ class Collector:
             if enter and enter.isdigit():
                 be.since = now_mono - int(enter) / 1e6
             be.port = sock_port or cfg.get("port")
-            if pid:
-                info = proc_read(pid)
-                if info is None:  # MainPID is the wrapper, look for the child
-                    info = next((p for p in proc_scan(re.compile(r"^llama-server$"))
-                                 if p.ppid == pid), None)
+            box = cfg.get("container")
+            if pid or box:
+                if box:
+                    info = self._container_proc(box)
+                else:
+                    info = proc_read(pid)
+                    if info is None:  # MainPID is the wrapper, look for the child
+                        info = next((p for p in proc_scan(re.compile(r"^llama-server$"))
+                                     if p.ppid == pid), None)
                 if info:
                     be.pid = info.pid
                     be.mem, be.mem_kind = info.rss, "RSS"
                     be.cpu = self.cpu.percent(info.pid, info.cpu_ticks)
                     self._attach_gpu(be)
                     live = parse_llama_argv(info.argv)
+                    if box:  # its own idea of host and port holds inside the container
+                        live.pop("port", None)
+                        live.pop("host", None)
                     cfg = {**cfg, **live}
             if cfg.get("port"):
                 self._llama_live(be, cfg.get("host") or "127.0.0.1", cfg["port"],

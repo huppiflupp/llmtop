@@ -194,6 +194,7 @@ the key bindings.
 |---|---|
 | llama.cpp: state, model, context | `systemctl show` on service and socket, start script |
 | llama.cpp: slots, tok/s | `GET /slots` on the internal port, delta of `n_decoded` |
+| Gufo in a container | same as llama.cpp: `gufo serve` in the start script, internal port from `-p host:container`, process from `podman inspect` |
 | Endpoints (`[endpoints] urls`) | name: host in the URL, reverse lookup of an address, or the configured `name`; engine: `owned_by` in `GET /v1/models`, confirmed once by `/props`, `/api/version`, `/version` or `/api/v1/health`; model: `/v1/models`, for Ollama `/api/ps`, for Lemonade `/api/v1/health`; `/slots` if it has one, else `/metrics`: busy from `requests_processing`, tok/s from `tokens_predicted_total` ÷ `tokens_predicted_seconds_total` of finished requests |
 | `ssh://host` | `llmtop --json-stream` on that host, over ssh |
 | Ollama: model, memory, unload timer | `GET /api/ps` (`size_vram`, `context_length`, `expires_at`) |

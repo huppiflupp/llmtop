@@ -41,7 +41,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 # An amdgpu card with at least this much VRAM of its own counts as discrete,
 # when sysfs does not say (mem_info_vram_vendor exists for real VRAM only).
 AMD_DISCRETE_VRAM = 2 << 30

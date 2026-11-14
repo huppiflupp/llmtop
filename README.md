@@ -136,20 +136,29 @@ Keys: `q` quit, `m` menu, `+`/`-` interval, `r` refresh now.
 `m` opens a menu over the panels, as in btop: the settings on one tab, the
 endpoints on the other (`Tab` switches). `↑`/`↓` pick a setting, `←`/`→` change
 it, and every change applies at once - theme, graph colours, interval, graph
-height, background, ASCII mode. On the endpoints tab `a` adds a server (type
-its URL, `Enter`), `u` and `n` edit URL and name, `d` deletes, and `Enter`
-tests the selected one right away: the line below shows what answers there
-(`llama.cpp · b392 · qwen3.6-35b-a3b · ctx 256k`) or `unreachable`; for an
-`ssh://` entry, whether ssh gets in and which llmtop answers. Testing an HTTP
-URL connects to it, so testing a socket port wakes its model. New
-endpoints appear in the Endpoints panel immediately. `s` writes everything to
-the config file, `Esc` closes the menu.
+height, background, ASCII mode and which rows are shown. On the endpoints tab
+`a` adds a server (type its URL, `Enter`), `u` and `n` edit URL and name, `d`
+deletes, and `Enter` tests the selected one right away: the line below shows
+what answers there (`llama.cpp · b392 · qwen3.6-35b-a3b · ctx 256k`) or
+`unreachable`; for an `ssh://` entry, whether ssh gets in and which llmtop
+answers. Testing an HTTP URL connects to it, so testing a socket port wakes its
+model. New endpoints appear in the Endpoints panel immediately. `s` writes
+everything to the config file, `Esc` closes the menu.
 
 ![The menu over the panels](docs/menu.png)
 
 Saving edits the file line by line: only the keys the menu knows are touched,
 comments and other sections stay, and the previous file is kept as
 `config.toml.bak`.
+
+`show = active` narrows the panels to the backends that are up: sleeping
+socket-activated ones, stopped services and unreachable endpoints drop out, and
+a panel with nothing up left in it is not drawn at all - the graphs above take
+those rows. What is hidden stays counted: the border of a panel that still has
+rows says `1 running … 6 hidden`. Only the drawing changes - everything is
+measured as before and `--json` stays complete. Note that an endpoint whose
+host does not answer is unreachable, so a machine that is down leaves no row
+behind.
 
 ### Themes
 

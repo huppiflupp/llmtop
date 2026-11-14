@@ -12,6 +12,9 @@ theme = "default"     # "default", "orange", a btop theme by name (dracula, nord
 graph_colors = "theme" # "theme": the theme's gradient; "default": llmtop's green to
                        # red inside the theme's frames and text
 background = "theme"  # "theme", "none" for the terminal's own, or an xterm-256 index
+show = "all"          # "all": every backend - "active": only the ones that are up. The
+                      # sleeping, stopped and unreachable rows go, and with them a panel
+                      # that has nothing up left. The measurements still happen.
 
 [llama]
 # Which systemd units to look for, in the user and system scopes.

@@ -2305,7 +2305,8 @@ class Collector:
 
 DEFAULT_CFG: dict = {
     "ui": {"interval": 2.0, "ascii": False, "graph_height": "auto",
-           "background": "theme", "theme": "default", "graph_colors": "theme"},
+           "background": "theme", "theme": "default", "graph_colors": "theme",
+           "show": "all"},
     "llama": {
         "unit_glob_socket": "llama-*.socket",
         "unit_glob_service": "llama-*.service",
@@ -2488,8 +2489,10 @@ BOX_STYLE = {"system": "b_system", "llama": "b_llama", "endpoint": "b_endpoint",
 
 
 class Renderer:
-    def __init__(self, ascii_mode: bool, graph_height: str | int = "auto") -> None:
+    def __init__(self, ascii_mode: bool, graph_height: str | int = "auto",
+                 show: str = "all") -> None:
         self.graph_height = graph_height
+        self.show = show  # "all", or "active" to leave out backends that are not up
         self.graphs: dict[str, Graph] = {}
         self._last_fed = -1.0
         self.set_ascii(ascii_mode)
@@ -2845,7 +2848,7 @@ class Renderer:
         return [(load.padded(), has_load), (size.padded(), has_size)]
 
     @staticmethod
-    def _summary(group: list[Backend]) -> str:
+    def _summary(group: list[Backend], hidden: int = 0) -> list[Seg]:
         counts: dict[str, int] = {}
         for be in group:
             counts[be.state] = counts.get(be.state, 0) + 1
@@ -2856,7 +2859,11 @@ class Renderer:
                 counts["busy"] = counts.get("busy", 0) + 1
         order = ("busy", RUNNING, SLEEPING, STOPPED, ABSENT)
         words = {"busy": "busy", **STATE_WORD}
-        return " · ".join(f"{counts[k]} {words[k]}" for k in order if counts.get(k))
+        segs: list[Seg] = [(" · ".join(f"{counts[k]} {words[k]}"
+                                       for k in order if counts.get(k)), "label")]
+        if hidden:
+            segs.append((f" {ELLIPSIS} {hidden} hidden", "dim"))
+        return segs
 
     # -- everything --------------------------------------------------------
 
@@ -2885,7 +2892,11 @@ class Renderer:
                live: bool) -> list[list[Seg]]:
         out = self._system_panel(snap, lay, live)
         by_kind: dict[str, list[Backend]] = {}
+        hidden: dict[str, int] = {}
         for be in snap.backends:
+            if self.show == "active" and be.state != RUNNING:
+                hidden[be.group] = hidden.get(be.group, 0) + 1
+                continue
             by_kind.setdefault(be.group, []).append(be)
         remote = [k for k in by_kind if k.startswith("ssh:")]
         kinds = [k for k in ("llama", "endpoint", *remote, "ollama", "lemonade", "bench")
@@ -2921,7 +2932,7 @@ class Renderer:
                         left.extend(r for r, has in rrows if has)
             title = KIND_TITLE.get(kind) or f"{kind[len('ssh:'):]} (ssh)"
             top = {"left": [(title, "title")],
-                   "right": [(self._summary(group), "label")]}
+                   "right": self._summary(group, hidden.get(kind, 0))}
             out += self._panel(lay, BOX_STYLE.get(kind, BOX_STYLE["endpoint"]), left, right, top,
                                footer if n == len(kinds) - 1 else {})
         return out
@@ -3413,7 +3424,8 @@ def set_toml_key(text: str, section: str, key: str, value: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-UI_KEYS = ("theme", "graph_colors", "interval", "graph_height", "background", "ascii")
+UI_KEYS = ("theme", "graph_colors", "interval", "graph_height", "background", "ascii",
+           "show")
 
 
 def save_config(ui: dict, endpoints: list) -> str:
@@ -3488,9 +3500,11 @@ class Menu:
         "graph_height": "auto fills the window - or 1 to 4 rows per graph",
         "background": "theme, none for the terminal's own, or an xterm-256 colour",
         "ascii": "plain ASCII instead of braille and box drawing",
+        "show": "all: every backend - active: only the ones that are up",
     }
     BACKGROUNDS: list = ["theme", None, *range(232, 256), *range(16, 232), *range(0, 16)]
     HEIGHTS = ["auto", 1, 2, 3, 4]
+    SHOWS = ["all", "active"]
 
     def __init__(self, ui: dict, endpoints: list, collector: Collector, on_change) -> None:
         self.ui = ui
@@ -3549,6 +3563,10 @@ class Menu:
             ui["background"] = opts[(idx + step) % len(opts)]
         elif key == "ascii":
             ui["ascii"] = not ui["ascii"]
+        elif key == "show":
+            opts = self.SHOWS
+            cur = ui["show"] if ui["show"] in opts else "all"
+            ui["show"] = opts[(opts.index(cur) + step) % len(opts)]
         self.dirty = True
         self.on_change(key)
 
@@ -3814,7 +3832,7 @@ def run_tui(collector: Collector, ui: dict) -> int:
         stdscr.keypad(True)
         pairs, base = build_pairs(curses, resolve_background(ui["background"]))
         stdscr.bkgd(" ", base)  # paints the background into every cell
-        renderer = Renderer(ui["ascii"], ui["graph_height"])
+        renderer = Renderer(ui["ascii"], ui["graph_height"], ui["show"])
         menu: Menu | None = None
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3839,6 +3857,9 @@ def run_tui(collector: Collector, ui: dict) -> int:
                 stdscr.clear()
             elif key == "ascii":
                 renderer.set_ascii(ui["ascii"])
+                stdscr.clear()
+            elif key == "show":
+                renderer.show = ui["show"]
                 stdscr.clear()
             elif key == "endpoints":
                 state["force"].set()
@@ -3963,6 +3984,7 @@ def main(argv: list[str] | None = None) -> int:
     background = parse_background(args.background if args.background is not None
                                   else cfg["ui"].get("background"))
     graph_colors = str(cfg["ui"].get("graph_colors") or "theme")
+    show = str(cfg["ui"].get("show") or "all")
     theme_name = args.theme or str(cfg["ui"].get("theme") or "default")
     set_theme(load_theme(theme_name, graph_colors))
     collector = Collector(cfg)
@@ -4000,8 +4022,8 @@ def main(argv: list[str] | None = None) -> int:
         color = sys.stdout.isatty() and not args.no_color
         width = size.columns - 1
         # One-shot output is not bound by the window height.
-        rows = Renderer(ascii_mode, graph_height if graph_height != "auto" else 1).rows(
-            sampled(), width, 10_000, interval, False)
+        rows = Renderer(ascii_mode, graph_height if graph_height != "auto" else 1,
+                        show).rows(sampled(), width, 10_000, interval, False)
         print_rows(rows, color, resolve_background(background), width)
         return 0
 
@@ -4010,7 +4032,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         ui = {"interval": interval, "ascii": ascii_mode, "graph_height": graph_height,
-              "background": background, "theme": THEME.name, "graph_colors": graph_colors}
+              "background": background, "theme": THEME.name, "graph_colors": graph_colors,
+              "show": show}
         return run_tui(collector, ui)
     except KeyboardInterrupt:
         return 0

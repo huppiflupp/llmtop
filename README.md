@@ -214,6 +214,7 @@ the key bindings.
 | GPU time per process | `/proc/<pid>/fdinfo`, delta of `drm-engine-*` |
 | GPU overall | `/sys/class/drm/card*/device` and `nvidia-smi`; with several cards the one running compute processes wins, then a discrete card over an integrated one (hybrid laptops: the NVIDIA card, not the iGPU driving the display) |
 | NPU | `/sys/class/accel/*`, `xrt-smi examine`, open `/dev/accel/*` handles |
+| Clients (`←` line) | `/proc/net/tcp` and `tcp6`, socket inodes in `/proc/<pid>/fd`, the program from `/proc/<pid>/cmdline` |
 | Benchmarks and measurement runs | processes by program name (`llama-bench`, `llama-perplexity`, `colibri`, …), `/proc/<pid>` and its `fdinfo` |
 
 Programs that load the machine without serving an API, such as `llama-bench`,
@@ -260,6 +261,30 @@ line below (`last request … tok/s`), so an idle server does not look busy.
 Because they are reached over HTTP, **an endpoint must not be a socket port**:
 every measurement would load its model. For a host with socket-activated
 backends use `ssh://host` (see above).
+
+### Who is connected
+
+Below a running llama.cpp, Ollama or Lemonade backend a `←` line names the
+programs holding a TCP connection to it, on the socket port and on the internal
+one: `← openviking-server › vlm-router · open_webui ×2 · 245k`. It is read from
+`/proc/net/tcp`, so it costs no request and wakes nothing.
+
+- A local client is named after its program, not its interpreter
+  (`python3 vlm-router.py` → `vlm-router`, `python -m uvicorn open_webui.main:app`
+  → `open_webui`, `node …/claude-code/cli.js` → `claude-code`).
+- A client that is itself a server with clients of its own — a router, a
+  gateway — is followed back up to three hops, so the row names the program that
+  causes the load: `openviking-server › vlm-router`.
+- `systemd-socket-proxyd` between socket and backend is skipped, as are llmtop's
+  own measurements.
+- A client on another machine shows as its host name (reverse lookup); which
+  program runs there cannot be seen from here.
+- Many clients open a connection per request. So that they do not flicker in and
+  out, each one stays listed for two minutes, dimmed and with the time since its
+  last connection (`claude-code 45s`). `×3` counts open connections.
+- A process of another user shows as `user <name>`: its sockets are not ours to
+  map to a program.
+- Linux only. The `clients` list is part of `--json` and travels over `ssh://`.
 
 ### Unified memory
 

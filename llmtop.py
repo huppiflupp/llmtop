@@ -557,6 +557,277 @@ def drm_proc_stats(pid: int) -> dict | None:
             "engine_ns": sum(c["engine_ns"] for c in clients.values())}
 
 
+# --------------------------------------------------------------------------
+# who is connected: TCP clients of a backend
+# --------------------------------------------------------------------------
+
+TCP_ESTABLISHED, TCP_LISTEN = "01", "0A"
+CLIENT_KEEP = 120.0  # seconds a client stays listed after its last connection
+CLIENT_HOPS = 3      # relays followed back to the program behind them
+# Plumbing between the socket port and the backend: its clients are the real ones.
+PROXY_PROGRAMS = ("systemd-socket-proxyd", "systemd-socket-")
+# Interpreters and app servers: the program is the script or module they run.
+INTERPRETERS = re.compile(r"^(python[\d.]*|node|nodejs|bun|deno|ruby|perl|java|sh|bash)$")
+GENERIC_SCRIPTS = ("cli", "index", "main", "server", "app", "run", "__main__")
+APP_SERVERS = ("uvicorn", "gunicorn", "hypercorn", "granian", "flask")
+
+
+def _tcp_addr(text: str) -> tuple[str, int]:
+    """'0100007F:1F9A' -> ('127.0.0.1', 8090), the same for IPv6."""
+    addr, _, port = text.partition(":")
+    raw = bytes.fromhex(addr)
+    # The kernel prints each 32-bit word in host byte order.
+    words = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4)) \
+        if sys.byteorder == "little" else raw
+    if len(words) == 4:
+        host = socket.inet_ntop(socket.AF_INET, words)
+    else:
+        host = socket.inet_ntop(socket.AF_INET6, words)
+        if host.startswith("::ffff:") and "." in host:
+            host = host[len("::ffff:"):]
+    return host, int(port, 16)
+
+
+@dataclass
+class TcpSock:
+    local: tuple[str, int]
+    remote: tuple[str, int]
+    state: str
+    uid: int
+    inode: int
+
+
+def tcp_table() -> list[TcpSock]:
+    """Established and listening TCP sockets from /proc/net/tcp and tcp6."""
+    socks = []
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        text = read_text(path) or ""
+        for line in text.splitlines()[1:]:
+            f = line.split()
+            if len(f) < 10 or f[3] not in (TCP_ESTABLISHED, TCP_LISTEN):
+                continue
+            try:
+                socks.append(TcpSock(_tcp_addr(f[1]), _tcp_addr(f[2]), f[3],
+                                     int(f[7]), int(f[9])))
+            except (ValueError, OSError):
+                continue
+    return socks
+
+
+def socket_owners(inodes: set[int]) -> dict[int, int]:
+    """Socket inode -> pid, for the processes whose fds we may read."""
+    owners: dict[int, int] = {}
+    if not inodes:
+        return owners
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                inode = int(link[8:-1])
+                if inode in inodes:
+                    owners.setdefault(inode, int(entry))
+        if len(owners) == len(inodes):
+            break
+    return owners
+
+
+def app_label(info: ProcInfo) -> str:
+    """The program a person would name: the script, not the interpreter.
+
+    /usr/bin/python3 vlm-router.py            -> vlm-router
+    python -m uvicorn open_webui.main:app     -> open_webui
+    venv/bin/python venv/bin/openviking-server -> openviking-server
+    """
+    argv = info.argv or [info.comm]
+    prog = os.path.basename(argv[0])
+    if not INTERPRETERS.match(prog):
+        return prog or info.comm
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-m" and i + 1 < len(args):
+            module = args[i + 1]
+            if module in APP_SERVERS:
+                target = next((a for a in args[i + 2:] if not a.startswith("-")), "")
+                return target.split(":")[0].split(".")[0] or module
+            return module
+        if arg in ("-c", "-e"):
+            return prog
+        if not arg.startswith("-"):
+            name = re.sub(r"\.(py|js|mjs|cjs|ts|rb|pl|sh)$", "", os.path.basename(arg))
+            if name in GENERIC_SCRIPTS:  # .../claude-code/cli.js -> claude-code
+                name = os.path.basename(os.path.dirname(arg)) or name
+            return name
+        i += 1
+    return prog
+
+
+def user_name(uid: int) -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, ImportError):
+        return str(uid)
+
+
+@dataclass
+class Client:
+    """One program talking to a backend, as shown in its row."""
+    name: str                 # "openviking-server › vlm-router", or a host name
+    connections: int = 0      # open right now; 0 = seen recently
+    pid: int | None = None
+    user: str = ""
+    host: str = ""            # set for a client on another machine
+    seen: float = 0.0         # seconds since it last held a connection
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "connections": self.connections, "pid": self.pid,
+                "user": self.user, "host": self.host, "seen_seconds_ago": self.seen}
+
+    @staticmethod
+    def from_dict(data: dict) -> "Client":
+        return Client(str(data.get("name") or "?"), int(data.get("connections") or 0),
+                      data.get("pid"), str(data.get("user") or ""),
+                      str(data.get("host") or ""), float(data.get("seen_seconds_ago") or 0))
+
+
+class ClientTracker:
+    """Who holds a TCP connection to which backend port.
+
+    Read from /proc only, no packets and no HTTP. A relay in between (the
+    vlm-router in front of Qwen, a gateway) is followed back to the programs
+    that talk to it, so the row names the one that causes the load. Clients
+    making one short request after another are open only part of the time,
+    so each stays listed for CLIENT_KEEP seconds, dimmed once its connection
+    is gone.
+    """
+
+    def __init__(self, resolve) -> None:
+        self.resolve = resolve  # address -> short host name
+        self.me = os.getpid()
+        self._seen: dict[tuple[str, str], tuple[float, Client]] = {}
+
+    def attach(self, backends: list[Backend]) -> None:
+        if IS_DARWIN:
+            return
+        wanted = [be for be in backends if be.state == RUNNING and be.ports and not be.host]
+        if not wanted:
+            return
+        socks = tcp_table()
+        listening: dict[int, set[int]] = {}  # port -> inodes of its listen sockets
+        by_local: dict[tuple[str, int], TcpSock] = {}
+        inbound: dict[int, list[TcpSock]] = {}  # server port -> accepted connections
+        for s in socks:
+            if s.state == TCP_LISTEN:
+                listening.setdefault(s.local[1], set()).add(s.inode)
+            else:
+                by_local[s.local] = s
+        listen_ports = set(listening)
+        for s in socks:
+            if s.state == TCP_ESTABLISHED and s.local[1] in listen_ports:
+                inbound.setdefault(s.local[1], []).append(s)
+        # The local end of every local client, to find its process.
+        need = {by_local[s.remote].inode for conns in inbound.values() for s in conns
+                if s.remote in by_local}
+        need |= {i for inodes in listening.values() for i in inodes}
+        owners = socket_owners(need)
+        port_owner: dict[int, int] = {}
+        for port, inodes in listening.items():
+            pid = next((owners[i] for i in inodes if i in owners), None)
+            if pid is not None:
+                port_owner[port] = pid
+        procs: dict[int, ProcInfo | None] = {}
+
+        def proc(pid: int) -> ProcInfo | None:
+            if pid not in procs:
+                procs[pid] = proc_read(pid)
+            return procs[pid]
+
+        def is_proxy(info: ProcInfo | None) -> bool:
+            if info is None:
+                return False
+            prog = os.path.basename(info.argv[0]) if info.argv else ""
+            return info.comm in PROXY_PROGRAMS or prog in PROXY_PROGRAMS
+
+        def is_llmtop(info: ProcInfo) -> bool:
+            return info.pid == self.me or any(
+                os.path.basename(a) == "llmtop" for a in info.argv[:2])
+
+        def sources(ports: set[int], depth: int, path: tuple[int, ...]) -> list[Client]:
+            """The clients behind the connections to these ports."""
+            found: list[Client] = []
+            for port in ports:
+                for conn in inbound.get(port, []):
+                    peer = by_local.get(conn.remote)
+                    if peer is None:  # another machine
+                        host = conn.remote[0]
+                        found.append(Client(self.resolve(host), 1, host=host))
+                        continue
+                    pid = owners.get(peer.inode)
+                    info = proc(pid) if pid else None
+                    if info is None:
+                        found.append(Client(f"user {user_name(peer.uid)}", 1,
+                                            user=user_name(peer.uid)))
+                        continue
+                    if is_llmtop(info) or pid in path:
+                        continue
+                    if is_proxy(info):
+                        continue  # its own inbound side is on a port we watch
+                    found.append(self._relay(info, peer.uid, depth, path, port_owner,
+                                             sources))
+            return found
+
+        now = time.monotonic()
+        for be in wanted:
+            path = (be.pid,) if be.pid else ()
+            current: dict[str, Client] = {}
+            for c in sources(set(be.ports), 0, path):
+                key = f"{c.host}|{c.name}"
+                if key in current:
+                    current[key].connections += c.connections
+                else:
+                    current[key] = c
+            for key, c in current.items():
+                self._seen[(be.key, key)] = (now, c)
+            out = list(current.values())
+            for (bkey, ckey), (when, c) in list(self._seen.items()):
+                if now - when > CLIENT_KEEP:
+                    del self._seen[(bkey, ckey)]
+                elif bkey == be.key and ckey not in current:
+                    out.append(Client(c.name, 0, c.pid, c.user, c.host, now - when))
+            out.sort(key=lambda c: (c.connections == 0, c.seen, -c.connections, c.name))
+            be.clients = out
+
+    def _relay(self, info: ProcInfo, uid: int, depth: int, path: tuple[int, ...],
+               port_owner: dict[int, int], sources) -> Client:
+        """A local client; when it is itself a server with clients of its own
+        (a router, a gateway), the programs behind it, joined with ›."""
+        me = Client(app_label(info), 1, info.pid, user_name(uid))
+        if depth + 1 >= CLIENT_HOPS:
+            return me
+        own_ports = {port for port, pid in port_owner.items() if pid == info.pid}
+        upstream = sources(own_ports, depth + 1, (*path, info.pid)) if own_ports else []
+        names = sorted({c.name for c in upstream if not c.host})
+        hosts = sorted({c.name for c in upstream if c.host})
+        behind = names + hosts
+        if not behind:
+            return me
+        lead = behind[0] if len(behind) == 1 else "{" + ", ".join(behind) + "}"
+        me.name = f"{lead} › {me.name}"
+        return me
+
+
 LEAD_MIN = 0.10  # below this share of the device nothing counts as leading
 
 
@@ -997,6 +1268,8 @@ class Backend:
     extras: list[str] = field(default_factory=list)
     children: list["Backend"] = field(default_factory=list)
     host: str = ""  # set for the backends of an ssh://host endpoint
+    ports: set[int] = field(default_factory=set)  # where its clients connect, local only
+    clients: list["Client"] = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -1128,6 +1401,7 @@ class Collector:
         self._guards_primed = False
         self._prev_cpu_total: tuple[int, int] | None = None
         self._machine: dict | None = None
+        self.clients = ClientTracker(self._host_label)
 
     # -- llama.cpp ---------------------------------------------------------
 
@@ -1281,6 +1555,7 @@ class Collector:
                          port=cfg.get("port"), ctx=cfg.get("ctx"),
                          model=model_label(cfg.get("model"), cfg.get("alias")),
                          mem=proc.rss, mem_kind="RSS")
+            be.ports = {cfg["port"]} if cfg.get("port") else set()
             be.cpu = self.cpu.percent(proc.pid, proc.cpu_ticks)
             self._attach_gpu(be)
             self._llama_extras(be, cfg)
@@ -1331,6 +1606,10 @@ class Collector:
         kept, hit or miss, so a slow resolver costs one scrape, not every one."""
         if name:
             return name
+        return f"{self._host_label(host)}:{port}"
+
+    def _host_label(self, host: str) -> str:
+        """An address as a short host name (192.168.178.63 -> 245k)."""
         label = host
         if is_ip(host):
             if host not in self._rdns:
@@ -1343,7 +1622,7 @@ class Collector:
             label = "localhost"
         elif not is_ip(label):
             label = label.split(".")[0]  # ai395.fritz.box -> ai395
-        return f"{label}:{port}"
+        return label
 
     def _engine_of(self, base: str, owner: str | None,
                    key: str | None = None) -> tuple[str, str | None]:
@@ -1591,9 +1870,11 @@ class Collector:
                     info = self._container_proc(box)
                 else:
                     info = proc_read(pid)
-                    if info is None:  # MainPID is the wrapper, look for the child
-                        info = next((p for p in proc_scan(re.compile(r"^llama-server$"))
-                                     if p.ppid == pid), None)
+                    server = re.compile(r"^llama-server$")
+                    if info is None or not proc_scan(server, [info]):
+                        # MainPID is a wrapper script: the server is its child
+                        child = next((p for p in proc_scan(server) if p.ppid == pid), None)
+                        info = child or info
                 if info:
                     be.pid = info.pid
                     be.mem, be.mem_kind = info.rss, "RSS"
@@ -1604,6 +1885,7 @@ class Collector:
                         live.pop("port", None)
                         live.pop("host", None)
                     cfg = {**cfg, **live}
+            be.ports = {p for p in (sock_port, cfg.get("port")) if p}
             if cfg.get("port"):
                 self._llama_live(be, cfg.get("host") or "127.0.0.1", cfg["port"],
                                  bool(cfg.get("metrics")), key=llama_key(be, cfg))
@@ -1783,6 +2065,7 @@ class Collector:
 
         m = re.search(r":(\d+)", host)
         be.port = int(m.group(1)) if m else None
+        be.ports = {be.port} if be.port else set()
 
         ver = http_json(f"{host}/api/version")
         if isinstance(ver, dict) and ver.get("version"):
@@ -1893,6 +2176,7 @@ class Collector:
             if dcfg.get("port"):
                 url = f"http://{dcfg.get('host', '127.0.0.1')}:{dcfg['port']}"
                 be.port = int(dcfg["port"])
+                be.ports = {be.port}
             be.cpu = self.cpu.percent(daemon.pid, daemon.cpu_ticks)
 
         props = self.sd.show(self.cfg["lemonade"]["unit"],
@@ -2294,6 +2578,7 @@ class Collector:
         bench = self.collect_bench(o_pids | l_pids)
         snap.backends = [*llama, *endpoints, ollama, lemon, *bench]
         attribute_gpu(snap)
+        self.clients.attach(snap.backends)
         self.cpu.sweep()
         self.gputime.sweep()
         return snap
@@ -2786,7 +3071,39 @@ class Renderer:
         for extra in be.extras:
             if not model.add_segs([(f" {self.mid} ", "dim"), (extra, "dim")]):
                 break
-        return [head.padded(), model.padded()]
+        rows = [head.padded(), model.padded()]
+        if be.clients:
+            rows.append(self._clients_line(be, width, indent))
+        return rows
+
+    def _clients_line(self, be: Backend, width: int, indent: int) -> list[Seg]:
+        """Who is connected: open connections bright, recent ones dimmed with their age."""
+        line = Line(width)
+        line.add(" " * (2 + indent))
+        line.add("<- " if self.ascii else "← ", "label")
+        for n, c in enumerate(be.clients):
+            segs: list[Seg] = []
+            if n:
+                segs.append((f" {self.mid} ", "dim"))
+            name = c.name.replace("›", ">") if self.ascii else c.name
+            if c.connections:
+                segs.append((name, "idle"))
+                if c.connections > 1:
+                    segs.append((f" ×{c.connections}" if not self.ascii
+                                 else f" x{c.connections}", "label"))
+            else:
+                segs.append((name, "dim"))
+                segs.append((f" {human_delta(c.seen)}", "dim"))
+            last = n == len(be.clients) - 1
+            room = line.left - (0 if last else 4)  # keep space for " +N"
+            if sum(len(t) for t, _ in segs) > room:
+                if n == 0:
+                    line.add_clipped(name, "idle" if c.connections else "dim")
+                else:
+                    line.add_clipped(f" +{len(be.clients) - n}", "dim")
+                break
+            line.add_segs(segs)
+        return line.padded()
 
     def _backend_right(self, be: Backend, lay: Layout,
                        live: bool) -> list[tuple[list[Seg], bool]]:
@@ -2926,6 +3243,9 @@ class Renderer:
                     if lay.split:
                         left.extend(lrows)
                         right.extend(r for r, _ in rrows)
+                        # keep both columns in step when the left one has a clients line
+                        right.extend(Line(lay.right_w).padded()
+                                     for _ in range(len(lrows) - len(rrows)))
                     else:
                         # Stacked: keep each backend's lines together.
                         left.extend(lrows)
@@ -3282,6 +3602,8 @@ def backend_to_dict(be: Backend) -> dict:
     }
     if be.host:
         data["host"] = be.host
+    if be.clients:
+        data["clients"] = [c.to_dict() for c in be.clients]
     if be.children:
         data["models"] = [backend_to_dict(c) for c in be.children]
     return data
@@ -3305,6 +3627,8 @@ def backend_from_dict(data: dict) -> Backend:
     be.extras = list(data.get("extras") or [])
     be.host = str(data.get("host") or "")
     be.children = [backend_from_dict(c) for c in data.get("models") or []]
+    be.clients = [Client.from_dict(c) for c in data.get("clients") or []
+                  if isinstance(c, dict)]
     return be
 
 
